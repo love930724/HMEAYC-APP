@@ -972,31 +972,6 @@ if not st.session_state.analysis_done:
                                                 "original_id": original_mid # [v16] 記錄原始 ID
                                             }
                                         
-                                        # [v12] Action Detection
-                                        if keypoints_data is not None and len(keypoints_data) > i:
-                                            kpts = keypoints_data[i]
-                                            # [v13] Pass BBox for Aspect Ratio check
-                                            bbox_xyxy = boxes[i] if i < len(boxes) else None
-                                            detected_tags = detectaction_and_gaze(kpts, bbox_xyxy) # -> ['舉手', '專注', '跳躍', '躺下']
-                                            for tag in detected_tags:
-                                                st.session_state.id_actions[mid][tag] += 1
-                                                
-                                            # [v19 New] Head Yaw & Gaze Calculation
-                                            # Nose(0), LEar(3), REar(4)
-                                            nose = kpts[0][:2] if kpts[0,2]>0.5 else None
-                                            l_ear = kpts[3][:2] if kpts[3,2]>0.5 else None
-                                            r_ear = kpts[4][:2] if kpts[4,2]>0.5 else None
-                                            
-                                            yaw = calculate_head_yaw(nose, l_ear, r_ear)
-                                            if mid not in st.session_state.id_yaw_history:
-                                                st.session_state.id_yaw_history[mid] = []
-                                            st.session_state.id_yaw_history[mid].append(yaw)
-                                            
-                                            # Focus Analysis (Simulated Target: Assume 'Teacher' is ID 1 or auto-detected later)
-                                            # Since we don't know Teacher yet, we store Yaw and Position.
-                                            # Real-time Interaction Check
-                                            if f_idx % 5 == 0: # Check every 5 frames to save perf
-                                                # Check against other visible IDs
                         try:
                             # [v21 Optimization] Cloud Performance Tuning
                             # 1. Skip every other frame (Process 15fps instead of 30fps)
