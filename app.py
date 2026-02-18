@@ -997,90 +997,147 @@ if not st.session_state.analysis_done:
                                             # Real-time Interaction Check
                                             if f_idx % 5 == 0: # Check every 5 frames to save perf
                                                 # Check against other visible IDs
-                                                curr_pos = (center_x, center_y)
-                                                
-                                                for other_mid, other_pos_list in st.session_state.id_positions.items():
-                                                    if other_mid == mid: continue
-                                                    if not other_pos_list or other_pos_list[-1][0] != f_idx: continue
-                                                    
-                                                    other_pos = other_pos_list[-1][1]
-                                                    dist = np.linalg.norm(np.array(curr_pos) - np.array(other_pos))
-                                                    
-                                                    # [v19.1 Update] Interaction Logic
-                                                    # 1. Distance < 1m (approx 80px, reduced from 120px)
-                                                    # 2. Duration > 3s (approx 90 frames or 18 checks at 5-frame intervals)
-                                                    
-                                                    pair = tuple(sorted((mid, other_mid))) # Canonical pair key
-                                                    
-                                                    is_close = dist < 80 
-                                                    looking_at_other = False
-                                                    
-                                                    if is_close:
-                                                        # Check Gaze
-                                                        looking_at_other = check_gaze_at_target(curr_pos, yaw, other_pos)
-                                                    
-                                                    if is_close and looking_at_other:
-                                                        # Interaction Candidate Found
-                                                        if pair not in st.session_state.id_gaze_start:
-                                                            st.session_state.id_gaze_start[pair] = f_idx
-                                                        else:
-                                                            # Check Duration
-                                                            start_f = st.session_state.id_gaze_start[pair]
-                                                            duration = f_idx - start_f
-                                                            
-                                                            # 3 seconds * 30 fps = 90 frames
-                                                            if duration > 90:
-                                                                # Valid Social Event!
-                                                                # Increment count (slowly)
-                                                                # To avoid exploding count, we can increment every 30 frames after threshold
-                                                                if duration % 30 == 0:
-                                                                    st.session_state.id_interactions[pair] += 1
-                                                                    # st.write(f"Debug: Interaction {pair} +1")
-                                                    else:
-                                                        # Interaction Broken (moved away or looked away)
-                                                        # Only reset if gaze broken for > 15 frames (tolerance)
-                                                        # Here simply reset for strictness
-                                                        if pair in st.session_state.id_gaze_start:
-                                                            del st.session_state.id_gaze_start[pair]
+                        try:
+                            # [v21 Optimization] Cloud Performance Tuning
+                            # 1. Skip every other frame (Process 15fps instead of 30fps)
+                            # 2. Reduce inference size to 480
+                            
+                            # Determine if we should process this frame
+                            should_process = (f_idx % 2 == 0)
+                            
+                            if should_process:
+                                # Run YOLO Tracking
+                                # [v21] Reduced imgsz from 640 to 480 for speed
+                                results = model.track(frame, persist=True, verbose=False, tracker=tracker_config, imgsz=480)
                                 
+                                if results[0].boxes.id is not None:
+                                    boxes = results[0].boxes.xyxy.cpu().numpy()
+                                    track_ids = results[0].boxes.id.int().cpu().numpy()
+                                    # keypoints = results[0].keypoints.xy.cpu().numpy() # [v2 tracking fix]
                                     
+                                    # [v2 Fix] Validate Keypoints Shape
+                                    if results[0].keypoints is not None:
+                                        keypoints = results[0].keypoints.xy.cpu().numpy()
+                                    else:
+                                        keypoints = []
+
+                                    annotated_frame = frame.copy() # Start with raw frame
+
+                                    for box, track_id, kpts in zip(boxes, track_ids, keypoints):
+                                        x1, y1, x2, y2 = map(int, box)
+                                        mid = int(track_id)
+                                        
+                                        # [v13 New] Store Box for Aspect Ratio
+                                        bbox = [x1, y1, x2, y2]
+                                        
+                                        # Store Movement History
+                                        center_x, center_y = (x1 + x2) // 2, (y1 + y2) // 2
+                                        if mid not in st.session_state.id_positions:
+                                            st.session_state.id_positions[mid] = []
+                                        st.session_state.id_positions[mid].append((f_idx, (center_x, center_y)))
+                                        
+                                        # [v19 New] Calculate Head Yaw & Focus
+                                        yaw = 0
+                                        if len(kpts) > 4: # Has ear/eye points
+                                            yaw = calculate_head_yaw(kpts)
+                                            if mid not in st.session_state.id_yaw_history:
+                                                st.session_state.id_yaw_history[mid] = []
+                                            st.session_state.id_yaw_history[mid].append(yaw)
+
+                                        # Store Actions
+                                        if mid not in st.session_state.id_actions:
+                                            st.session_state.id_actions[mid] = {}
+                                            
+                                        # Detect Actions (包含 [v13] 蹲下/跳躍判斷)
+                                        current_actions = detectaction_and_gaze(kpts, bbox)
+                                        
+                                        # [v18.5] Record Actions to Global Log
+                                        for act in current_actions:
+                                            st.session_state.id_actions[mid][act] = st.session_state.id_actions[mid].get(act, 0) + 1
+                                    
+                                        # Draw
+                                        color = (0, 255, 0)
+                                        if "舉手" in current_actions: color = (0, 0, 255) # Red for Hands Up
+                                        
+                                        # Skeleton drawing
+                                        for i in range(len(kpts)):
+                                            x, y = int(kpts[i][0]), int(kpts[i][1])
+                                            if x > 0 and y > 0:
+                                                 cv2.circle(annotated_frame, (x, y), 3, color, -1)
+                                                 
+                                        # Connections (Simplified)
+                                        skeleton_links = [
+                                            (5, 7), (7, 9), (6, 8), (8, 10), # Arms
+                                            (11, 13), (13, 15), (12, 14), (14, 16), # Legs
+                                            (5, 6), (11, 12), (5, 11), (6, 12) # Torso
+                                        ]
+                                        for p1, p2 in skeleton_links:
+                                            if p1 < len(kpts) and p2 < len(kpts):
+                                                pt1 = (int(kpts[p1][0]), int(kpts[p1][1]))
+                                                pt2 = (int(kpts[p2][0]), int(kpts[p2][1]))
+                                                if pt1[0]>0 and pt2[0]>0:
+                                                    cv2.line(annotated_frame, pt1, pt2, color, 2)
+
+                                        # [v19.1] Interaction Lines (Visual Only)
+                                        curr_pos = (center_x, center_y)
+                                        for other_mid, other_pos_list in st.session_state.id_positions.items():
+                                            if other_mid == mid: continue
+                                            if not other_pos_list or other_pos_list[-1][0] != f_idx: continue
+                                            other_pos = other_pos_list[-1][1]
+                                            # Check stored interaction
+                                            pair = tuple(sorted((mid, other_mid)))
+                                            if pair in st.session_state.id_gaze_start:
+                                                 # Visual Line
+                                                 cv2.line(annotated_frame, curr_pos, other_pos, (255, 255, 0), 2)
+                                                 
+                                        # Label
                                         lbl = f"ID:{mid}"
-                                        lbl = f"ID:{mid}"
-                                        # [調整] 字體大小調整 (0.6), font thickness 2 (1.6 -> 2)
                                         font_scale = 0.6
                                         thickness = 2
                                         ts = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0]
                                         label_w, label_h = ts
-                                        label_w, label_h = ts
                                         
-                                        # [智慧型標籤定位] 
                                         if y1 < label_h + 30:
-                                            # Bottom-Left
                                             text_org = (x1 + 5, y2 - 8)
-                                            bg_pt1 = (x1, y2 - label_h - 12) # Tighter box
+                                            bg_pt1 = (x1, y2 - label_h - 12)
                                             bg_pt2 = (x1 + label_w + 10, y2)
                                         else:
-                                            # Top-Left
                                             text_org = (x1 + 5, y1 - 8)
-                                            bg_pt1 = (x1, y1 - label_h - 12) # Tighter box
+                                            bg_pt1 = (x1, y1 - label_h - 12)
                                             bg_pt2 = (x1 + label_w + 10, y1)
                                         
-                                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 140, 255), 4) # 橘色框
-                                        cv2.rectangle(annotated_frame, bg_pt1, bg_pt2, (0,0,0), -1) # 黑色背景
+                                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 140, 255), 4)
+                                        cv2.rectangle(annotated_frame, bg_pt1, bg_pt2, (0,0,0), -1)
                                         cv2.putText(annotated_frame, lbl, text_org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
-                               
-                                st.session_state.last_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-                                st_frame.image(st.session_state.last_frame)
                                 
-                                # [v15] Write frame to video
-                                if out_video is not None and out_video.isOpened():
-                                    out_video.write(annotated_frame)
+                                    st.session_state.last_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+                                    st_frame.image(st.session_state.last_frame)
+                                    
+                                    # Save for next frame skipping
+                                    st.session_state.last_annotated_frame = annotated_frame
+                                    
+                                else:
+                                    # No detection this frame
+                                    st.session_state.last_annotated_frame = frame
+                                    
                             else:
-                                # [v15] Write original frame if detection failed
-                                if out_video is not None and out_video.isOpened():
-                                    out_video.write(frame)
-                                pass
+                                # [Skipped Frame] Reuse last annotated frame for smoothness
+                                # Or just use raw frame? Using raw frame might flicker.
+                                # Using last_annotated_frame is better for video output.
+                                if 'last_annotated_frame' in st.session_state and st.session_state.last_annotated_frame is not None:
+                                    annotated_frame = st.session_state.last_annotated_frame
+                                else:
+                                    annotated_frame = frame
+                                    
+                            # Write to Video
+                            if out_video is not None and out_video.isOpened():
+                                out_video.write(annotated_frame)
+
                         except Exception as e:
+                            # [Fix] Import Error Handling for Cloud
+                            if "lap" in str(e) or "LAP" in str(e):
+                                st.error("❌ 缺少 'lap' 模組。請確認 requirements.txt 包含 'lapx'。")
+                                st.stop()
                             st.write(f"[Debug] Frame {f_idx} Error: {e}")
                             pass
 
