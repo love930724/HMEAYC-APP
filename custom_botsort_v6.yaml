@@ -1,0 +1,12 @@
+
+tracker_type: botsort
+track_high_thresh: 0.25  # [最終修正] 0.25 (捕捉跳動/低品質偵測，挽救 ID 16/18/20)
+track_low_thresh: 0.1
+new_track_thresh: 0.45   # [救回 ID 18] 降回 0.45，讓短暫出現的人能被追蹤
+track_buffer: 60  
+match_thresh: 0.7        # [最終修正] 維持 0.7 平衡
+fuse_score: True
+gmc_method: sparseOptFlow
+proximity_thresh: 0.5
+appearance_thresh: 0.25
+with_reid: False

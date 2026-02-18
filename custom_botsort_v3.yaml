@@ -1,0 +1,12 @@
+
+tracker_type: botsort
+track_high_thresh: 0.35  # [修正] 提高到 0.35，避免低品質偵測建立新軌跡 (ID 505 的原因)
+track_low_thresh: 0.1
+new_track_thresh: 0.4    # [修正] 提高到 0.4，只有非常確定的偵測才產生新 ID
+track_buffer: 60  
+match_thresh: 0.7        # [修正] 設為 0.7 平衡匹配精度
+fuse_score: True
+gmc_method: sparseOptFlow
+proximity_thresh: 0.5
+appearance_thresh: 0.25
+with_reid: False
