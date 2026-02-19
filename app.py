@@ -1045,9 +1045,9 @@ if not st.session_state.analysis_done:
                                                     # Current H
                                                     h = y2 - y1
                                                     
-                                                    # Threshold: 10% of body height (More sensitive)
+                                                    # Threshold: 20% of body height (Strict to avoid standing jitter)
                                                     # Note: Y increases downwards. So Jump means Y decreases.
-                                                    if center_y < avg_y - (h * 0.10): 
+                                                    if center_y < avg_y - (h * 0.20): 
                                                         current_action = "跳躍"
                                                         color = (255, 255, 0) # Cyan (Yellow-ish)
 
@@ -1226,9 +1226,20 @@ if not st.session_state.analysis_done:
                 st.session_state.final_id_list = sorted(list(st.session_state.id_list))
 
                 # [v17] 顯示鑑識重播 (直接嵌入，取代單張預覽圖)
+                # [v17] 顯示鑑識重播 (直接嵌入，取代單張預覽圖)
                 if st.session_state.video_output_path and os.path.exists(st.session_state.video_output_path):
-                     st.info("🎥 分析影片重播")
-                     st.video(st.session_state.video_output_path)
+                     # [Cloud Fix] Check file size
+                     if os.path.getsize(st.session_state.video_output_path) > 1000:
+                        try:
+                            with open(st.session_state.video_output_path, 'rb') as v:
+                                video_bytes = v.read()
+                            st.info("🎥 分析影片重播")
+                            st.video(video_bytes, format="video/mp4")
+                        except Exception as e:
+                            st.error(f"無法讀取影片檔: {e}")
+                     else:
+                        st.warning("⚠️ 影片檔案過小或寫入失敗 (可能是Codec問題)。")
+
                 elif st.session_state.last_frame is not None:
                     st.image(st.session_state.last_frame, caption="分析結果預覽 (注意：ID 已重新編號)", width=800)
                 else:
@@ -1429,8 +1440,11 @@ else:
             role = "獨立觀察 (Independent)" 
             
             # Hierarchy of Roles
-            if interaction_count >= 30: # [v22 Fix] Increase threshold (was 5) to avoid everyone being "Active"
+            # [v22 Fix] "Socially Active" now requires Motion >= 3 to avoid stationary observers being labeled Active
+            if interaction_count >= 30 and score >= 3:
                 role = "社交活躍 (Active)"
+            elif interaction_count >= 30:
+                role = "靜態互動 (Passive)" # New role for stationary but crowded/interacting kids
             elif focus_score >= 60:
                 role = "專注跟隨 (Focused)"
             elif sync_score is not None and sync_score >= 80:
