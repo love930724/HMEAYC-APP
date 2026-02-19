@@ -782,14 +782,15 @@ if not st.session_state.analysis_done:
                         # [v18.6 Fix] Save to project dir to ensure persistence
                         output_path = os.path.abspath("obs_video.mp4")
                         
-                        # [v18.7 Fix] Use H.264 (avc1) for browser compatibility
-                        fourcc = cv2.VideoWriter_fourcc(*'avc1') 
+                        # [v23 Fix] Use mp4v for writing (more robust), then convert with FFmpeg
+                        fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
                         try:
                             out_video = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
                             if not out_video.isOpened():
-                                # Fallback to mp4v if avc1 fails
-                                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                                out_video = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+                                st.error("❌ 無法建立影片寫入器 (mp4v fail)")
+                        except Exception as e:
+                            st.warning(f"⚠️ 影片寫入器初始化失敗: {e}")
+                            out_video = None
                         except Exception as e:
                             st.warning(f"⚠️ 影片寫入器初始化失敗: {e}")
                             out_video = None
@@ -1187,9 +1188,41 @@ if not st.session_state.analysis_done:
                     # 清理暫存檔
                     if os.path.exists(tfile_path):
                         try:
-                            os.remove(tfile_path)
+                            # os.remove(tfile_path) # Debug: Keep for now
+                            pass 
                         except:
                             pass
+                            
+                    # [v23 Fix] Convert to H.264 using FFmpeg for Browser Compatibility
+                    if out_video is not None:
+                        out_video.release() # Ensure closed
+                        
+                        if os.path.exists(output_path):
+                            # Define converted path
+                            converted_path = os.path.abspath("obs_video_h264.mp4")
+                            
+                            st.info("🔄 正在轉換影片格式 (H.264) 以支援網頁播放...")
+                            
+                            # FFmpeg command: -y (overwrite), -i input, -vcodec libx264, output
+                            # Note: Streamlit Cloud has ffmpeg installed via packages.txt
+                            import subprocess
+                            try:
+                                command = [
+                                    "ffmpeg", "-y", 
+                                    "-i", output_path,
+                                    "-vcodec", "libx264",
+                                    "-f", "mp4",
+                                    converted_path
+                                ]
+                                subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                
+                                # Update session path to converted file
+                                st.session_state.video_output_path = converted_path
+                            except Exception as e:
+                                st.warning(f"⚠️ 影片轉檔失敗 (可能缺少 FFmpeg): {e}")
+                                # Fallback to original
+                                st.session_state.video_output_path = output_path
+
         # 這裡的邏輯是：如果已經處理完 (session_state 有紀錄)，就顯示完成按鈕
         # 這樣就不會每次按按鈕都重跑上面的 while 迴圈
         if st.session_state.processed_file == uploaded_file.name:
