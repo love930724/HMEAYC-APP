@@ -113,7 +113,9 @@ REF_COLORS = {
     "牛仔藍": (110, 150, 200),
     "深藍": (115, 200, 100),
     "紫色": (140, 150, 200),
+    "淺紫": (135, 60, 220),       # [v24 Add] User ID 4 Fix (Low Saturation Purple)
     "粉紅": (160, 100, 240),
+    "桃紅/洋紅": (170, 180, 200), # [v24 Add] Magenta
     "白色": (0, 0, 240),
     "灰色": (0, 0, 128),
     "黑色": (0, 0, 30),
@@ -782,12 +784,16 @@ if not st.session_state.analysis_done:
                         # [v18.6 Fix] Save to project dir to ensure persistence
                         output_path = os.path.abspath("obs_video.mp4")
                         
-                        # [v23 Fix] Use mp4v for writing (more robust), then convert with FFmpeg
-                        fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
+                        # [v23 Fix] Revert to 'avc1' first for Local Compatibility
+                        # If 'avc1' fails (e.g. Cloud), it falls back to 'mp4v'
+                        # Then FFmpeg Post-Processing (below) fixes it for Web
+                        fourcc = cv2.VideoWriter_fourcc(*'avc1') 
                         try:
                             out_video = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
                             if not out_video.isOpened():
-                                st.error("❌ 無法建立影片寫入器 (mp4v fail)")
+                                # Fallback to mp4v if avc1 fails
+                                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                                out_video = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
                         except Exception as e:
                             st.warning(f"⚠️ 影片寫入器初始化失敗: {e}")
                             out_video = None
@@ -1206,21 +1212,29 @@ if not st.session_state.analysis_done:
                             # FFmpeg command: -y (overwrite), -i input, -vcodec libx264, output
                             # Note: Streamlit Cloud has ffmpeg installed via packages.txt
                             import subprocess
-                            try:
-                                command = [
-                                    "ffmpeg", "-y", 
-                                    "-i", output_path,
-                                    "-vcodec", "libx264",
-                                    "-f", "mp4",
-                                    converted_path
-                                ]
-                                subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                                
-                                # Update session path to converted file
-                                st.session_state.video_output_path = converted_path
-                            except Exception as e:
-                                st.warning(f"⚠️ 影片轉檔失敗 (可能缺少 FFmpeg): {e}")
-                                # Fallback to original
+                            import shutil
+                            
+                            # Check if ffmpeg is available
+                            if shutil.which("ffmpeg"):
+                                try:
+                                    command = [
+                                        "ffmpeg", "-y", 
+                                        "-i", output_path,
+                                        "-vcodec", "libx264",
+                                        "-f", "mp4",
+                                        converted_path
+                                    ]
+                                    # Use a timeout of 60s
+                                    subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+                                    
+                                    # Update session path to converted file
+                                    st.session_state.video_output_path = converted_path
+                                except Exception as e:
+                                    logging.warning(f"FFmpeg conversion failed: {e}")
+                                    # Fallback to original
+                                    st.session_state.video_output_path = output_path
+                            else:
+                                logging.info("FFmpeg not found. Skipping conversion.")
                                 st.session_state.video_output_path = output_path
 
         # 這裡的邏輯是：如果已經處理完 (session_state 有紀錄)，就顯示完成按鈕
