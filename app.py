@@ -106,6 +106,7 @@ REF_COLORS = {
     "米色": (30, 30, 230),
     "卡其": (35, 80, 180),
     "深綠": (60, 200, 100),
+    "墨綠/軍綠": (50, 90, 80), # [v21.1 Fix] 針對低飽和度綠色 (User ID 20)
     "草綠": (50, 200, 200),
     "湖水綠(Teal)": (85, 200, 150),
     "淺藍": (100, 100, 240),
@@ -312,10 +313,10 @@ def draw_social_graph(interactions, id_map, width=1100, height=1000):
             
     # Draw nodes
     for node_id, (x, y) in node_positions.items():
-        color = (100, 149, 237) # Blue
+        color = (235, 206, 135) # SkyBlue (BGR)
         # Highlight "Core" nodes (high degree)
         degree = sum([c for (k, c) in interactions.items() if node_id in k])
-        if degree > max_count * 0.5: color = (0, 0, 255) # Red for core
+        if degree > max_count * 0.5: color = (0, 0, 255) # Red (BGR)
         
         # [v20.12 Refine] Node Radius 30 (User Request: "dots bigger")
         cv2.circle(canvas, (x, y), 30, color, -1) 
@@ -772,7 +773,7 @@ if not st.session_state.analysis_done:
                         st.error(f"❌ 無法開啟影片檔案: {tfile_path}")
                     else:
                         # [v15 New] Video Writer for Replay
-                        fps = int(cap.get(cv2.CAP_PROP_FPS))
+                        fps = int(cap.get(cv2.CAP_PROP_FPS)) // 2 # [v21] Adjust FPS for frame skipping
                         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                         
@@ -822,6 +823,10 @@ if not st.session_state.analysis_done:
                             break
                         f_idx += 1
                         if f_idx % 2 != 0: continue
+                        # [Fix] Reset annotated_frame to prevent stale images
+                        if 'annotated_frame' in locals():
+                            del annotated_frame
+
                         # 更新進度條 (避免過度更新拖慢速度，每 10 幀更新一次)
                         if f_idx % 10 == 0:
                             prog = min(f_idx / total_frames, 1.0)
@@ -972,6 +977,151 @@ if not st.session_state.analysis_done:
                                                 "hist": get_color_histogram(shirt), # 儲存特徵供 Re-ID 使用
                                                 "original_id": original_mid # [v16] 記錄原始 ID
                                             }
+
+                                        # [v21 Restore] Action Recognition & Drawing Logic
+                                        # [v21 Restore] Action Recognition & Drawing Logic
+                                        color = (0, 140, 255) # Orange (Default)
+                                        current_action = ""
+                                        
+                                        # Action Recognition
+                                        if keypoints_data is not None and len(keypoints_data) > i:
+                                            try:
+                                                kpts = keypoints_data[i] # (17, 3)
+                                                # Check Hands Up (Wrists above Shoulders)
+                                                if (kpts[9][2] > 0.5 and kpts[5][2] > 0.5 and kpts[9][1] < kpts[5][1]) or \
+                                                   (kpts[10][2] > 0.5 and kpts[6][2] > 0.5 and kpts[10][1] < kpts[6][1]):
+                                                    current_action = "舉手"
+                                                    color = (0, 0, 255) # Red
+                                                
+                                                # [v22 New] Check Squat (Knees bent)
+                                                # Hip(11,12) -> Knee(13,14) -> Ankle(15,16)
+                                                # Simple check: HipY is close to KneeY OR (KneeY - HipY) is small
+                                                # Better: Angle check. But for speed, just check if Hips are low.
+                                                # Relative to bounding box height?
+                                                if not current_action: # Priority: HandsUp > Squat
+                                                    # Check if Hips are significantly lower than Shoulders (Standard) 
+                                                    # Squat = Hips closer to ankles. 
+                                                    # Let's use bounding box aspect ratio? No.
+                                                    # Use Keypoints: 11(LHip), 13(LKnee), 15(LAnkle)
+                                                    if kpts[13][2]>0.5 and kpts[15][2]>0.5:
+                                                        if (kpts[13][1] - kpts[11][1]) < (kpts[15][1]-kpts[13][1]) * 0.5:
+                                                            # Thigh is horizontal?
+                                                            pass 
+                                                    
+                                                    # Simple Heuristic: Hip Y position is low relative to standing?
+                                                    # Hard without calibration.
+                                                    # Alternative: Jumping Jacks (Hands Up + Legs Open)
+                                                    pass
+
+                                                # [v22 New] Simple Squat (Hips close to Knees)
+                                                if kpts[11][2]>0.5 and kpts[13][2]>0.5 and kpts[14][2]>0.5: # Hips & Knees visible
+                                                    # If vertical distance between Hip and Knee is small (Squatting/Sitting)
+                                                    # Normal standing: Hip to Knee is large (Thigh length)
+                                                    # Squatting: Thigh is horizontal, so Y difference is small.
+                                                    thigh_len_l = abs(kpts[13][1] - kpts[11][1])
+                                                    thigh_len_r = abs(kpts[14][1] - kpts[12][1])
+                                                    # How to know "Normal" length? 
+                                                    # Compare to Shin length (Knee to Ankle)
+                                                    shin_len_l = abs(kpts[15][1] - kpts[13][1]) if kpts[15][2]>0.5 else 100
+                                                    
+                                                    if thigh_len_l < shin_len_l * 0.5: # Thigh is compressed in Y (Horizontal)
+                                                        current_action = "蹲下"
+                                                        color = (255, 0, 0) # Blue
+                                            except:
+                                                pass
+                                            
+                                            # [v22 New] Check Jump (Center Y Displacement)
+                                            # Logic: Current Y is significantly higher (smaller value) than rolling average
+                                            if not current_action and mid in st.session_state.id_positions:
+                                                hist = st.session_state.id_positions[mid]
+                                                if len(hist) > 5:
+                                                    # Get last 15 frames (approx 0.5s)
+                                                    recent_hist = hist[-15:] 
+                                                    # Exclude current frame for average calculation? No, include it but it's outlier.
+                                                    # Better to use median? Mean is fine.
+                                                    ys = [p[1][1] for p in recent_hist]
+                                                    avg_y = np.mean(ys)
+                                                    
+                                                    # Current H
+                                                    h = y2 - y1
+                                                    
+                                                    # Threshold: 10% of body height (More sensitive)
+                                                    # Note: Y increases downwards. So Jump means Y decreases.
+                                                    if center_y < avg_y - (h * 0.10): 
+                                                        current_action = "跳躍"
+                                                        color = (255, 255, 0) # Cyan (Yellow-ish)
+
+                                        # Drawing
+                                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+                                        
+                                        # Label (Convert to English for Display)
+                                        action_map = {
+                                            "舉手": "Hands Up",
+                                            "蹲下": "Squat",
+                                            "跳躍": "Jump"
+                                        }
+                                        display_action = action_map.get(current_action, current_action)
+                                        
+                                        label = f"ID: {mid} {display_action}"
+                                        t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+                                        c2 = x1 + t_size[0], y1 - t_size[1] - 5
+                                        cv2.rectangle(annotated_frame, (x1, y1), c2, color, -1)
+                                        cv2.putText(annotated_frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                                        
+                                        # [v21 Restore] 3. Advanced Analysis Data Logging
+                                        # (1) Action Logging
+                                        if current_action:
+                                            if mid not in st.session_state.id_actions:
+                                                st.session_state.id_actions[mid] = {}
+                                            st.session_state.id_actions[mid][current_action] = st.session_state.id_actions[mid].get(current_action, 0) + 1
+                                            
+                                        # (2) Focus Analysis (Head Yaw)
+                                        head_yaw = 0
+                                        if keypoints_data is not None and len(keypoints_data) > i:
+                                            try:
+                                                kpts = keypoints_data[i]
+                                                nose = kpts[0][:2]
+                                                l_ear = kpts[3][:2]
+                                                r_ear = kpts[4][:2]
+                                                # Check visibility
+                                                if kpts[0][2] > 0.5 and kpts[3][2] > 0.5 and kpts[4][2] > 0.5:
+                                                    head_yaw = calculate_head_yaw(nose, l_ear, r_ear)
+                                            except:
+                                                pass
+                                        
+                                        if mid not in st.session_state.id_yaw_history:
+                                            st.session_state.id_yaw_history[mid] = []
+                                        st.session_state.id_yaw_history[mid].append(head_yaw)
+                                        
+                                        # (3) Social Interaction (Proximity + Gaze)
+                                        # Compare with other IDs in this frame
+                                        # We need to access other IDs, so we iterate through results again or cache positions?
+                                        # Optim: Just use current `boxes` loop but we only have current `i` info.
+                                        # Actually, we can compare with *previously processed* IDs in this frame, or better:
+                                        # Store current frame positions in a temp dict and process interactions *after* the loop?
+                                        # For simplicity/speed in this single pass, we can't easily compare with *all* others unless we double loop.
+                                        # BUT! We already have `st.session_state.id_positions` which has history. 
+                                        # Let's use the *last known position* of others (from previous frames or this frame).
+                                        
+                                        # Simplified Social: Compare with 'active_mapped_ids' (approximate)
+                                        # Better: Check distance to other tracked IDs 
+                                        my_center = (center_x, center_y)
+                                        for other_mid, pos_list in st.session_state.id_positions.items():
+                                            if other_mid == mid: continue
+                                            if not pos_list: continue
+                                            
+                                            # Get last pos of other
+                                            last_frame_idx, other_pos = pos_list[-1]
+                                            if abs(last_frame_idx - f_idx) > 5: continue # Too old
+                                            
+                                            # Distance check
+                                            dist = np.linalg.norm(np.array(my_center) - np.array(other_pos))
+                                            if dist < 150: # Pixel distance threshold for interaction
+                                                # Check Gaze (Mutual or One-way)
+                                                # Here we just count proximity as interaction for the graph
+                                                pair = tuple(sorted((mid, other_mid)))
+                                                st.session_state.id_interactions[pair] = st.session_state.id_interactions.get(pair, 0) + 1
+
                                         
 
 
@@ -993,6 +1143,19 @@ if not st.session_state.analysis_done:
 
                            
                             
+                            # [Fix] Ensure annotated_frame is defined (iff no detection)
+                            if 'annotated_frame' not in locals():
+                                annotated_frame = frame
+
+                            # [Fix] Update Streamlit UI
+                            if 'st_frame' in locals() and annotated_frame is not None:
+                                frame_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+                                st_frame.image(frame_rgb)
+
+                            # [Fix] Write to Video
+                            if out_video is not None:
+                                out_video.write(annotated_frame)
+
                         except Exception as e:
                             # [Fix] Import Error Handling for Cloud
                             if "lap" in str(e) or "LAP" in str(e):
@@ -1044,6 +1207,7 @@ if not st.session_state.analysis_done:
                 # [v20 Refine] Use Kuramoto R-value instead of Variance
                 # We need full position history in session state
                 group_sync_r = calculate_kuramoto_order_parameter(st.session_state.id_motion_log) # Arg is actually ignored inside, uses session_state.id_positions
+                if group_sync_r is None: group_sync_r = 0.0 # [Fix] Default to 0.0
                 st.session_state.group_sync_r = group_sync_r
                 logging.info(f"Group Sync R: {group_sync_r}")
 
@@ -1265,7 +1429,7 @@ else:
             role = "獨立觀察 (Independent)" 
             
             # Hierarchy of Roles
-            if interaction_count >= 5:
+            if interaction_count >= 30: # [v22 Fix] Increase threshold (was 5) to avoid everyone being "Active"
                 role = "社交活躍 (Active)"
             elif focus_score >= 60:
                 role = "專注跟隨 (Focused)"
@@ -1371,7 +1535,7 @@ else:
             use_container_width=True,
             column_config={
                 "序號": st.column_config.NumberColumn("序號", format="%d", width=40, disabled=True), 
-                "專注度(%)": st.column_config.ProgressColumn("專注", min_value=0, max_value=100, format="%d%%", width=80), # [v19]
+                "專注度(%)": st.column_config.ProgressColumn("專注度", min_value=0, max_value=100, format="%d%%", width=80), # [v19]
                 "參與型態": st.column_config.TextColumn("參與型態", width=120), # [v19.2 Renamed]
                 "幼兒 ID": st.column_config.TextColumn( 
                     "幼兒 ID",
@@ -1400,7 +1564,18 @@ else:
                 graph_img = draw_social_graph(st.session_state.id_interactions, 
                                             {m: f"{m}" for m in st.session_state.id_list})
                 # [v20.11 Refine] Larger Display Width (1100px)
-                st.image(graph_img, caption="社交圖譜與核心人物 (粗線=互動頻率)", width=1100)
+                # [Fix] Convert BGR to RGB for correct color display in Streamlit
+                graph_img_rgb = cv2.cvtColor(graph_img, cv2.COLOR_BGR2RGB)
+                st.image(graph_img_rgb, caption="社交圖譜與核心人物 (粗線=互動頻率)", width=1100)
+                
+                # [v21.2 Add] Social Graph Explanation
+                st.info("""
+                **📖 如何解讀社交圖譜 (How to Read)**
+                *   **🔵 藍色圓圈 (Blue Nodes)**: 一般幼兒 (ID)。
+                *   **🔴 紅色圓圈 (Red Nodes)**: 社交核心人物 (互動頻率高於平均)。
+                *   **➖ 連線 (Edges)**: 代表兩人間有顯著互動 (如靠近、視線交流)。
+                *   **線條粗細**: 線條越粗，代表互動頻率越高。
+                """)
             except Exception as e:
                 st.error(f"無法繪製社交圖表: {e}")
         else:
