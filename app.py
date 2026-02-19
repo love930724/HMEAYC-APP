@@ -14,6 +14,191 @@ import sys
 import logging
 import uuid # [v15 Fix] Avoid file lock
 from collections import defaultdict
+import sqlite3 # [v27 Add] Database Support
+
+# [v27 Add] Database Config
+DB_FILE = "hmeayc.db"
+
+def init_db():
+    """Initialize SQLite database with required tables."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    
+    # 1. Observations Table (Master)
+    c.execute('''CREATE TABLE IF NOT EXISTS observations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    obs_date TEXT,
+                    observer_name TEXT,
+                    activity_name TEXT,
+                    video_file TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    is_deleted INTEGER DEFAULT 0  -- [v43 New] Soft Delete Flag
+                )''')
+                
+    # [v43 Fix] Auto-migration check (Add is_deleted if missing)
+    try:
+        c.execute("SELECT is_deleted FROM observations LIMIT 1")
+    except sqlite3.OperationalError:
+        c.execute("ALTER TABLE observations ADD COLUMN is_deleted INTEGER DEFAULT 0")
+        conn.commit()
+                
+    # 2. Records Table (Details per student)
+    c.execute('''CREATE TABLE IF NOT EXISTS records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    obs_id INTEGER,
+                    student_id TEXT,
+                    role TEXT,
+                    score REAL,
+                    sync_score REAL,
+                    focus_score REAL,
+                    temp_lag REAL,
+                    comment TEXT,
+                    FOREIGN KEY (obs_id) REFERENCES observations (id)
+                )''')
+    conn.commit()
+    conn.close()
+
+def save_analysis_to_db(observer, activity, video, df):
+    """Save the analyzed dataframe to SQLite with Update Capability."""
+    if df.empty: return False
+    
+    try:
+        conn = sqlite3.connect(DB_FILE) # Fix: Use string or variable consistently
+        c = conn.cursor()
+        
+        # [v32 Fix] Check if we already have a session ID for this analysis
+        obs_id = st.session_state.get('current_obs_id', None)
+        
+        if obs_id:
+            # Update mode: Delete old records first (simplest way to handle full refresh)
+            # Or Update Master Record timestamp
+            c.execute("UPDATE observations SET timestamp=CURRENT_TIMESTAMP, is_deleted=0 WHERE id=?", (obs_id,))
+            
+            # Delete details (Hard delete details is fine, assuming we re-insert)
+            c.execute("DELETE FROM records WHERE obs_id=?", (obs_id,))
+        else:
+            # Insert Master Record
+            date_str = datetime.now().strftime("%Y-%m-%d")
+            c.execute("INSERT INTO observations (obs_date, observer_name, activity_name, video_file, is_deleted) VALUES (?, ?, ?, ?, 0)",
+                      (date_str, observer, activity, video))
+            obs_id = c.lastrowid
+            st.session_state.current_obs_id = obs_id # Save for next time
+        
+        # Insert Student Records (New or Re-insert)
+        for _, row in df.iterrows():
+            # Parse numerical values safe
+            try:
+                score = float(row.get("AI 觀察判定 (1-5)", 0))
+                sync = float(row.get("跟隨指令 (同步率%)", 0))
+                focus = float(row.get("專注度(%)", 0))
+                
+                # Parse Lag (string "0.5s" -> float 0.5)
+                lag_str = str(row.get("時序延遲 (Lag)", "0")).replace("s", "")
+                lag = 0.0
+                if lag_str != "-":
+                    try: 
+                        lag = float(lag_str)
+                    except:
+                        lag = 0.0
+                        
+                comment = row.get("AI 總結評語", "")
+                role = row.get("參與型態", "Unknown")
+                s_id = row.get("幼兒 ID", "Unknown")
+                
+                # [v27] SQLite Schema mismatch fix?
+                # Check table schema: records has (obs_id, student_id, role, score, sync_score, focus_score, temp_lag, comment)
+                # But wait, create table code (lines 38-49) has different column names?
+                # "score REAL", "sync_score REAL" ...
+                # It matches the Insert statement below.
+                
+                c.execute('''INSERT INTO records 
+                             (obs_id, student_id, role, score, sync_score, focus_score, temp_lag, comment)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                          (obs_id, s_id, role, score, sync, focus, lag, comment))
+            except Exception as e:
+                # logging.error(f"DB Row Error: {e}")
+                pass 
+                
+        conn.commit()
+        conn.close()
+        return True, obs_id # Return ID for feedback
+    except Exception as e:
+        return False, str(e)
+
+# [v43 New] Soft Delete & Restore Logic
+# [v43 New] Soft Delete & Restore Logic
+# delete_observation_record relocated below to avoid duplication
+
+def restore_observation_record(obs_id):
+    """Restore a soft-deleted record."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("UPDATE observations SET is_deleted=0 WHERE id=?", (obs_id,))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logging.error(f"Restore Error: {e}")
+        return False
+        return False
+
+# [v41 New] History Management Helpers
+# [v41 New] History Management Helpers
+def delete_student_record(obs_id, student_id):
+    """Delete a specific student record from an observation."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("DELETE FROM records WHERE obs_id=? AND student_id=?", (obs_id, student_id))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logging.error(f"Delete Student Error: {e}")
+        return False
+
+def rename_student_record(obs_id, old_name, new_name):
+    """Rename a specific student in an observation record."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("UPDATE records SET student_id=? WHERE obs_id=? AND student_id=?", (new_name, obs_id, old_name))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logging.error(f"Rename Student Error: {e}")
+        return False
+
+# [v47 New] Identity Merge for Unifying Records
+def merge_student_identity(source_name, target_name):
+    """
+    Merge all records of 'source_name' into 'target_name'.
+    Returns (success, count_updated).
+    """
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        
+        # Check if source exists
+        c.execute("SELECT COUNT(*) FROM records WHERE student_id=?", (source_name,))
+        count = c.fetchone()[0]
+        
+        if count == 0:
+            conn.close()
+            return False, 0
+            
+        # Update records
+        c.execute("UPDATE records SET student_id=? WHERE student_id=?", (target_name, source_name))
+        updated_rows = c.rowcount
+        
+        conn.commit()
+        conn.close()
+        return True, updated_rows
+    except Exception as e:
+        logging.error(f"Merge Identity Error: {e}")
+        return False, 0
 
 # [v12] PyInstaller Path Resolver
 def get_resource_path(relative_path):
@@ -99,24 +284,26 @@ if 'processed_file' not in st.session_state: st.session_state.processed_file = N
 # [v10] Color Hunt 專業色票庫 (HSV: H[0-180], S[0-255], V[0-255])
 REF_COLORS = {
     "正紅": (0, 200, 200),
-    "酒紅": (175, 200, 100),
+    "暗紅/棗紅": (175, 160, 100), # [v38 Fix] Capture Dark Red/Maroon
+    "酒紅": (170, 200, 100),
     "亮橘": (15, 200, 250),
     "鵝黃": (30, 100, 240),
     "土黃/芥末": (30, 200, 150),
-    "米色": (30, 30, 230),
+    "米色": (25, 30, 230), # [v38] Lower Hue slightly
     "卡其": (35, 80, 180),
     "深綠": (60, 200, 100),
-    "墨綠/軍綠": (50, 90, 80), # [v21.1 Fix] 針對低飽和度綠色 (User ID 20)
+    "墨綠/軍綠": (55, 90, 60), # [v38 Fix] Lower V (80->60) to avoid confusion with dark red
     "草綠": (50, 200, 200),
     "湖水綠(Teal)": (85, 200, 150),
     "淺藍": (100, 100, 240),
     "牛仔藍": (110, 150, 200),
     "深藍": (115, 200, 100),
     "紫色": (140, 150, 200),
-    "淺紫": (135, 60, 220),       # [v24 Add] User ID 4 Fix (Low Saturation Purple)
+    "淺紫": (135, 90, 220),       
     "粉紅": (160, 100, 240),
-    "桃紅/洋紅": (170, 180, 200), # [v24 Add] Magenta
-    "白色": (0, 0, 240),
+    "白/粉紅白": (165, 30, 240), # [v38] Handle pinkish white
+    "桃紅/洋紅": (170, 180, 200), 
+    "白色": (0, 0, 250), # [v38] Higher V
     "灰色": (0, 0, 128),
     "黑色": (0, 0, 30),
     "焦糖/棕色": (20, 150, 150)
@@ -305,27 +492,48 @@ def draw_social_graph(interactions, id_map, width=1100, height=1000):
     # Draw edges
     max_count = max(interactions.values()) if interactions else 1
     
+    # [v33 Update] Lower threshold to show more connections
+    # [v33 Update] Darker lines for visibility
+    
     for (id1, id2), count in interactions.items():
-        if count < 3: continue # Filter weak interactions
+        if count < 2: continue # [v33] Lowered threshold from 3 to 2
+        
         pt1 = node_positions.get(id1)
         pt2 = node_positions.get(id2)
+        
         if pt1 and pt2:
-            thickness = max(1, int((count / max_count) * 5))
-            cv2.line(canvas, pt1, pt2, (200, 200, 200), thickness)
+            # Thickness based on frequency (1 to 8)
+            thickness = max(1, int((count / max_count) * 8)) 
+            
+            # Color: Darker Gray for better contrast (100,100,100)
+            cv2.line(canvas, pt1, pt2, (150, 150, 150), thickness)
             
     # Draw nodes
     for node_id, (x, y) in node_positions.items():
         color = (235, 206, 135) # SkyBlue (BGR)
         # Highlight "Core" nodes (high degree)
         degree = sum([c for (k, c) in interactions.items() if node_id in k])
-        if degree > max_count * 0.5: color = (0, 0, 255) # Red (BGR)
+        if degree > max_count * 0.4: color = (0, 0, 255) # Red (BGR) [v33] Lowered active threshold
         
         # [v20.12 Refine] Node Radius 30 (User Request: "dots bigger")
         cv2.circle(canvas, (x, y), 30, color, -1) 
         cv2.circle(canvas, (x, y), 30, (0, 0, 0), 2)
         
+        # Show ID
+        # [v31] Support Custom Name if available?
+        # Canvas drawing logic is separate from DF. 
+        # But we can try to look up from session state if simple enough.
+        # For graph clarity, maybe keep ID number? Or use Name if short.
         label = str(node_id)
         if "Teacher" in id_map.get(node_id, ""): label = "T"
+        
+        # Try to use Custom Name if defined in session state
+        # (This is a nice-to-have, but graph might get crowded)
+        # Let's check session state
+        real_label = label
+        # We don't have direct access to session_state here comfortably without import issues?
+        # Actually we do, inside the function.
+        # But `id_map` passed in is usually just {id: id_string}.
         
         # [v20.12 Refine] Larger font for larger nodes (0.4 -> 0.8)
         font_scale = 0.8
@@ -447,6 +655,50 @@ def calculate_teacher_sync(student_pos, teacher_pos):
     
     return round(score, 1)
 
+def analyze_temporal_sync(motion_s, motion_t, fps=30, max_lag_sec=1.5):
+    """
+    [v26 New] Calculate Temporal Lag using Cross-Correlation on Motion Energy.
+    Returns: (max_correlation, lag_in_seconds)
+    Msg: "Sync" or "Delay 0.5s"
+    """
+    if not motion_s or not motion_t: return 0.0, 0.0
+    
+    # Ensure equal length / align to the shorter one's end (most recent)
+    min_len = min(len(motion_s), len(motion_t))
+    if min_len < 30: return 0.0, 0.0 # Too short
+    
+    # Take recent history (e.g., last 10 seconds = 300 frames)
+    window = 300
+    s = np.array(motion_s[-window:])
+    t = np.array(motion_t[-window:])
+    
+    # Normalize (Z-score) to avoid amplitude bias
+    if np.std(s) < 1e-6 or np.std(t) < 1e-6: return 0.0, 0.0
+    s = (s - np.mean(s)) / np.std(s)
+    t = (t - np.mean(t)) / np.std(t)
+    
+    # Cross Correlation
+    # mode='full' returns array of size N+M-1. Index of max correlates to lag.
+    corr = np.correlate(s, t, mode='full') / len(s) # Normalize by length
+    
+    # Lag finding
+    # Center index (0 lag) is at len(t) - 1
+    lags = np.arange(-len(t) + 1, len(s))
+    max_idx = np.argmax(corr)
+    max_corr = corr[max_idx]
+    best_lag = lags[max_idx]
+    
+    # Convert lag frames to seconds
+    # lag > 0 means s is AHEAD of t? np.correlate(s, t): sum(s[k] * t[k+delay])
+    # Usually: if s is shifted by +d to match t, then s was behind.
+    lag_sec = best_lag / fps
+    
+    # Limit to realistic lag (e.g. +/- 1.5s)
+    if abs(lag_sec) > max_lag_sec:
+        return 0.0, 0.0
+        
+    return max_corr, lag_sec
+
 # [新增] 2. 同步率 (R-Value) 計算
 def calculate_group_sync(id_motion_scores):
     # id_motion_scores: {mid: [score1, score2, ...]}
@@ -541,63 +793,375 @@ def calculate_group_sync(id_positions):
         
     return round(float(np.mean(coherence_scores)), 2)
 
+# [v30 New] Randomized Advice Templates
+ADVICE_TEMPLATES = {
+    "active_low_sync": [
+        "建議教師邀請其擔任小隊長或示範者，將充沛能量轉化為帶領同儕的動力，提升自信與成就感。",
+        "可嘗試賦予其「動作發想者」的角色，在自由律動時間鼓勵其創造新動作，引導同儕模仿。",
+        "建議在團體活動中安排「紅綠燈」或「定格」遊戲，幫助其練習肢體控制與衝動抑制。"
+    ],
+    "passive_observer": [
+        "建議可安排與較活躍的同儕配對遊戲，透過同儕互動帶動其肢體開展，從觀察過渡到參與。",
+        "教師可主動靠近並以眼神鼓勵，或牽手邀請其加入小圈圈，建立安全感降低焦慮。",
+        "建議先從「小道具操作」（如絲巾、響板）入手，降低直接肢體表現的心理門檻。"
+    ],
+    "delayed_follower": [
+        "建議教師在動作示範時提供更明確的視覺提示（如倒數或誇大預備動作），或稍放慢節奏，協助其跟上團體律動。",
+        "可運用音樂節拍較明顯的曲目，並搭配口語指令（如「1、2、3、跳」），強化其聽覺與動作的連結。",
+        "建議安排其站在教師正對面或視覺干擾較少的位置，確保能清楚接收示範訊號。"
+    ],
+    "independent": [
+        "建議先肯定其獨特的動作表現，再逐步引導其將個人動作融入團體指令，建立連結感。",
+        "教師可模仿其動作並賦予正向意義（如「哇，這是一隻很有創意的恐龍」），再邀請其模仿老師。",
+        "在團體指令中保留「自由發揮」的時段，滿足其探索需求，同時要求在特定訊號回到團體規範。"
+    ],
+    "low_focus": [
+        "建議運用色彩鮮豔的教具或聲音變化來吸引其視覺注意力，增加眼神接觸的機會。",
+        "教師可縮短指令語句，並在發號施令前先喊其名字或輕拍肩膀，確保注意力已連線。",
+        "建議安排在前排或靠近教師的位置，減少環境視覺干擾，並給予即時的正向回饋。"
+    ],
+    "high_performance": [
+        "建議提供更高難度或變化的動作挑戰，維持其學習動機並展現優勢能力。",
+        "可邀請其擔任「小老師」協助其他同學，培養同理心與照顧他人的能力。",
+        "建議引導其注意動作的細節與質感（如「輕輕地飛」vs「用力地跳」），深化美感體驗。"
+    ]
+}
+
 def generate_expert_comment(score, sync_score, focus_score, role, valid_tags, class_stats=None):
     """
-    [v21 Upgrade] Context-Aware Expert System.
-    Inputs:
-        ...
-        class_stats: dict {'avg_focus': 50, 'avg_motion': 3, ...}
+    [v21 Upgrade] Context-Aware Expert System with Non-Arbitrary Language.
+    [v26 Update] Added Temporal Sync Logic.
+    [v30 Update] Randomized Advice for Variety.
     """
     parts = []
     
-    # [v21 New] Contextual Comparison
-    is_above_avg = False
+    # [v26] Extract Temporal Info
+    temp_corr = 0.0
+    lag_sec = 0.0
     if class_stats:
-        avg_f = class_stats.get('avg_focus', 0)
-        avg_m = class_stats.get('avg_motion', 0)
-        
-        if focus_score > avg_f + 15:
-            parts.append("專注度顯著高於班級平均，展現優異定力。")
-            is_above_avg = True
-        if score > avg_m + 1.0:
-            parts.append("為班級中動作最活躍的成員之一。")
-
-    # 1. Social Role Insight (Fallback if not above avg)
-    if not is_above_avg:
-        if "Active" in role or "社交活躍" in role:
-            parts.append("該幼兒為班級互動核心，展現極強的社交動機。")
-        elif "Focused" in role or "專注跟隨" in role:
-            parts.append("表現出極佳的學習專注力，善於透過觀察學習。")
-        elif "Imitating" in role or "動作模仿" in role:
-            parts.append("肢體協調性佳，能準確轉化視覺指令為動作。")
-        elif "Independent" in role or "獨立觀察" in role:
-            parts.append("傾向獨立觀察與思考，學習風格較為內斂。")
-        
-    # 2. Sync vs Focus Analysis
-    sync = sync_score if sync_score else 0
-    focus = focus_score if focus_score else 0
+        temp_corr = class_stats.get('temp_corr', 0.0)
+        lag_sec = class_stats.get('lag_sec', 0.0)
     
-    if sync >= 80 and focus >= 80:
-        parts.append("動作精準且全神貫注，展現高品質的學習表現。")
-    elif sync >= 80 and focus < 50:
-        parts.append("雖然視線未完全集中，但肢體模仿極為精準，展現身體智慧。")
-    elif sync < 50 and focus >= 80:
-        parts.append("全神貫注觀察，但動作轉換稍有遲疑，建議引導其肢體協調發展。")
-    elif sync < 50 and focus < 50:
-        parts.append("目前處於探索階段，尚未完全進入模仿狀態。")
+    # [Fix] Sanitize inputs
+    if sync_score is None: sync_score = 0
+    if focus_score is None: focus_score = 0
+    
+    # 1. Role-based Observation (Descriptive)
+    if not role or role == "Unknown":
+        pass
+    elif "Teacher" in role:
+        parts.append("擔任示範者角色，動作引導清晰。")
+    elif "Active" in role:
+        parts.append("展現高度動作活躍性，積極參與活動。")
+    elif "Passive" in role:
+        parts.append("維持高互動頻率，但肢體動作幅度較小（靜態互動）。")
+    elif "Focused" in role:
+        parts.append("動作幅度適中，視覺注意力高度集中於示範者。")
+    elif "Imitating" in role:
+        parts.append("展現明顯的模仿行為，與示範者動作同步度高。")
+    elif "Independent" in role:
+        parts.append("表現出獨立的動作模式，較少跟隨示範者。")
         
-    # 3. Motion Energy
-    if score >= 4:
-        parts.append("體能充沛，動作幅度大且充滿自信。")
-    elif score <= 2:
-        parts.append("動作較為細微保守。")
+    # 2. Sync / Temporal Analysis (Descriptive)
+    if sync_score > 80:
+        parts.append("動作與示範者高度同步，節奏掌握精確。")
+    elif sync_score < 60 and temp_corr > 0.6:
+        # Delayed Follower
+        if abs(lag_sec) > 0.2:
+             parts.append(f"觀察到動作有約 {abs(lag_sec):.2f} 秒的延遲，顯示其為觀察後模仿的習性。")
+        else:
+             parts.append("雖空間同步率較低，但時間序列顯示其動作趨勢與老師一致。")
+    elif sync_score < 40:
+        parts.append("動作節奏與團體有顯著差異，可能有自己的探索步調。")
         
     # 4. Action Specifics
-    action_str = "、".join([t for t in valid_tags if t not in ['專注', '側臉']])
-    if action_str:
-        parts.append(f"擅長「{action_str}」等動作類型。")
+    # Filter out internal tags
+    visible_actions = [t for t in valid_tags if t not in ['專注', '側臉']]
+    if visible_actions:
+        action_str = "、".join(visible_actions)
+        parts.append(f"頻繁出現「{action_str}」等動作特徵。")
+
+    # 5. Teacher Guidance (New)
+    # Provide actionable advice based on profile
+    suggestions = []
+    import random # Ensure random is available
+    
+    # Case: Active but Low Sync (High Energy, Independent/Active)
+    if "Active" in role and sync_score < 60:
+        suggestions.append(random.choice(ADVICE_TEMPLATES["active_low_sync"]))
         
+    # Case: Passive but High Focus (Observer)
+    elif "Passive" in role or ("Focused" in role and score < 3):
+        suggestions.append(random.choice(ADVICE_TEMPLATES["passive_observer"]))
+        
+    # Case: Delayed Sync (Slow Follower)
+    elif abs(lag_sec) > 0.3:
+        suggestions.append(random.choice(ADVICE_TEMPLATES["delayed_follower"]))
+        
+    # Case: Independent (Low Sync, Own Pace)
+    elif "Independent" in role and sync_score < 40:
+        suggestions.append(random.choice(ADVICE_TEMPLATES["independent"]))
+        
+    # Case: Low Focus (Distracted)
+    elif focus_score < 40:
+        suggestions.append(random.choice(ADVICE_TEMPLATES["low_focus"]))
+        
+    # Case: High Performance (High Sync + High Focus)
+    elif sync_score > 80 and focus_score > 80:
+        suggestions.append(random.choice(ADVICE_TEMPLATES["high_performance"]))
+
+    if suggestions:
+        parts.append("\n\n💡 教學建議：" + "".join(suggestions))
+
     return "".join(parts)
+
+# ... (Original detectaction_and_gaze stays above, skipping diff context here for brevity) ...
+
+# ... (Previous code) ...
+
+# [v30 New] History Management
+def delete_observation_record(obs_id):
+    """Soft Delete: Mark as deleted but keep data."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        # Soft delete only master record is enough if we filter by it
+        c.execute("UPDATE observations SET is_deleted=1 WHERE id=?", (obs_id,))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"Soft Delete Error: {e}")
+        return False
+
+def show_history_ui():
+    st.title("🗄️ 歷史紀錄與幼兒成長歷程")
+    
+    # 1. Fetch Master List (Filter OUT deleted items)
+    conn = sqlite3.connect(DB_FILE)
+    df_obs = pd.read_sql_query("SELECT * FROM observations WHERE is_deleted=0 ORDER BY timestamp DESC", conn)
+    conn.close()
+    
+    if df_obs.empty:
+        st.info("尚無歷史紀錄 (或全部已刪除)。請先在「全功能分析」模式下進行分析並儲存。")
+        # Allow viewing Trash Can even if main list is empty?
+        # Maybe not block immediately if we want to access Trash Can.
+        # But for now, user might have deleted everything.
+        # Let's check if there are ANY records including deleted.
+        conn = sqlite3.connect(DB_FILE)
+        count = pd.read_sql_query("SELECT COUNT(*) FROM observations", conn).iloc[0,0]
+        conn.close()
+        
+        if count == 0:
+             st.stop()
+        else:
+             st.warning("目前顯示列表為空，但垃圾桶中可能有資料。")
+        
+    # Master Table
+    st.subheader("📋 活動觀察紀錄列表")
+    
+    # [v41] Manage/Delete Section (Enhanced)
+    with st.expander("🛠️ 資料庫管理 (Database Management)"):
+        # Create tabs for different management actions
+        m_tab1, m_tab2, m_tab3, m_tab4 = st.tabs(["🗑️ 刪除整筆觀察", "✏️ 修改/刪除幼兒資料", "♻️ 垃圾桶 (復原刪除)", "👥 身份合併 (Merge)"])
+        
+        with m_tab1:
+            st.caption("⚠️ 此操作將刪除該次觀察的所有數據 (包含所有幼兒紀錄)。")
+            obs_to_delete = st.selectbox("選擇要刪除的紀錄:", 
+                                       df_obs['id'].astype(str) + " | " + df_obs['obs_date'] + " | " + df_obs['activity_name'],
+                                       index=None,
+                                       placeholder="請選擇...",
+                                       key="del_obs_select"
+            )
+            if obs_to_delete:
+                obs_id = int(obs_to_delete.split(" | ")[0])
+                if st.button(f"確認刪除紀錄 ({obs_id})", type="primary", key="btn_del_obs"):
+                    if delete_observation_record(obs_id):
+                        st.success("紀錄已刪除！請重新整理頁面。")
+                        st.session_state.clear()
+                        st.rerun()
+                    else:
+                        st.error("刪除失敗。")
+
+        with m_tab2:
+            st.caption("🔧 針對特定幼兒進行改名或刪除操作。")
+            
+            # 1. Select Observation
+            target_obs_str = st.selectbox("1. 選擇紀錄:", 
+                                       df_obs['id'].astype(str) + " | " + df_obs['obs_date'] + " | " + df_obs['activity_name'],
+                                       index=None,
+                                       placeholder="請先選擇紀錄...",
+                                       key="edit_obs_select"
+            )
+            
+            if target_obs_str:
+                target_obs_id = int(target_obs_str.split(" | ")[0])
+                
+                # 2. Get Students in this observation
+                conn = sqlite3.connect("hmeayc.db")
+                stu_df = pd.read_sql_query("SELECT DISTINCT student_id FROM records WHERE obs_id=?", conn, params=(target_obs_id,))
+                conn.close()
+                
+                target_student = st.selectbox("2. 選擇幼兒:", 
+                                            stu_df['student_id'].tolist(),
+                                            index=None,
+                                            placeholder="請選擇幼兒...",
+                                            key="edit_stu_select"
+                )
+                
+                if target_student:
+                    action = st.radio("3. 選擇操作:", ["改名 (Rename)", "刪除此人 (Delete)"], horizontal=True)
+                    
+                    if action == "改名 (Rename)":
+                        new_name_input = st.text_input("輸入新名稱:", value=target_student)
+                        if st.button("確認改名", key="btn_rename"):
+                            if new_name_input and new_name_input != target_student:
+                                if rename_student_record(target_obs_id, target_student, new_name_input):
+                                    st.success(f"已將 {target_student} 改名為 {new_name_input}")
+                                    st.rerun()
+                                else:
+                                    st.error("改名失敗")
+                            else:
+                                st.warning("名稱未變更")
+                                
+                    elif action == "刪除此人 (Delete)":
+                        st.error(f"⚠️ 即將從此紀錄中移除 {target_student}，此操作僅影響單一學生！")
+                        if st.button("確認移除此人", type="primary", key="btn_del_stu"):
+                            if delete_student_record(target_obs_id, target_student):
+                                st.success(f"已移除 {target_student}")
+                                st.rerun()
+                            else:
+                                st.error("移除失敗")
+
+
+        with m_tab3: # [v43 New] Trash Can Tab
+            st.caption("♻️ 這裡存放被軟刪除的紀錄，您可以隨時復原。")
+            conn = sqlite3.connect(DB_FILE)
+            df_deleted = pd.read_sql_query("SELECT * FROM observations WHERE is_deleted=1 ORDER BY timestamp DESC", conn)
+            conn.close()
+            
+            if df_deleted.empty:
+                st.info("垃圾桶是空的 (0 筆資料)。")
+            else:
+                obs_to_restore = st.selectbox("選擇要復原的紀錄:", 
+                                           df_deleted['id'].astype(str) + " | " + df_deleted['obs_date'] + " | " + df_deleted['activity_name'],
+                                           index=None,
+                                           placeholder="請選擇復原對象...",
+                                           key="restore_obs_select"
+                )
+                if obs_to_restore:
+                    obs_id_restore = int(obs_to_restore.split(" | ")[0])
+                    if st.button(f"確認復原紀錄 ({obs_id_restore})", key="btn_restore"):
+                        if restore_observation_record(obs_id_restore):
+                            st.success(f"紀錄 {obs_id_restore} 已成功復原！")
+                            st.rerun()
+                        else:
+                            st.error("復原失敗")
+
+        with m_tab4: # [v47 New] Identity Merge Tab
+            st.caption("👥 將多個暫存 ID (如 ID_1) 合併到同一位學生 (如 小明) 名下。此操作無法復原。")
+            
+            # Get distinct student IDs
+            conn = sqlite3.connect(DB_FILE)
+            temp_df = pd.read_sql_query("SELECT DISTINCT student_id FROM records ORDER BY student_id", conn)
+            conn.close()
+            
+            all_ids = temp_df['student_id'].tolist() if not temp_df.empty else []
+            
+            col_m1, col_m2 = st.columns(2)
+            
+            with col_m1:
+                target_merge_name = st.selectbox("1. 保留的目標 (Target):", all_ids, key="merge_target", index=0 if all_ids else None)
+                
+            with col_m2:
+                # Filter out target from source options
+                source_options = [x for x in all_ids if x != target_merge_name]
+                source_merge_name = st.selectbox("2. 要合併的來源 (Source):", source_options, key="merge_source", index=0 if source_options else None)
+                
+            if st.button("🚀 確認合併身分", type="primary", use_container_width=True, disabled=not (target_merge_name and source_merge_name)):
+                if target_merge_name == source_merge_name:
+                    st.warning("目標與來源不能相同。")
+                else:
+                    success, count = merge_student_identity(source_merge_name, target_merge_name)
+                    if success:
+                        st.success(f"✅ 成功將 {count} 筆紀錄從 '{source_merge_name}' 合併至 '{target_merge_name}'！")
+                        st.rerun()
+                    else:
+                        st.error("❌ 合併失敗或來源無資料。")
+
+    st.dataframe(df_obs, use_container_width=True, hide_index=True)
+    
+    # ... (Rest of existing history UI logic: Student Selection, Charts etc.) ...
+    # Re-implementing the rest of show_history_ui below to ensure continuity
+    
+    st.markdown("---")
+    st.subheader("📈 幼兒個人成長歷程")
+    
+    # Get unique student IDs from all records
+    conn = sqlite3.connect(DB_FILE)
+    all_students = pd.read_sql_query("SELECT DISTINCT student_id FROM records ORDER BY student_id", conn)
+    conn.close()
+    
+    student_list = all_students['student_id'].tolist()
+    
+    # Helper to sort IDs numerically if possible
+    def try_sort(x):
+        try:
+            if "ID_" in x and "(" in x: # Format: ID_1 (Original)
+                return int(x.split("_")[1].split(" ")[0])
+            return x
+        except:
+            return x
+            
+    # student_list.sort(key=try_sort) # Sort tricky with mixed types
+    
+    selected_student = st.selectbox("選擇幼兒 (ID/姓名):", student_list)
+    
+    if selected_student:
+        # Fetch history for this student
+        # JOIN to get date/activity
+        q = f"""
+        SELECT r.*, o.obs_date, o.activity_name 
+        FROM records r
+        JOIN observations o ON r.obs_id = o.id
+        WHERE r.student_id = '{selected_student}'
+        ORDER BY o.obs_date ASC
+        """
+        conn = sqlite3.connect(DB_FILE)
+        df_hist = pd.read_sql_query(q, conn)
+        conn.close()
+        
+        if not df_hist.empty:
+            # Metrics
+            col1, col2 = st.columns(2)
+            avg_sync = df_hist['sync_score'].mean()
+            avg_focus = df_hist['focus_score'].mean()
+            
+            col1.metric("平均同步率", f"{avg_sync:.1f}%")
+            col2.metric("平均專注度", f"{avg_focus:.1f}%")
+            
+            # Charts
+            tab1, tab2 = st.tabs(["📊 趨勢圖表", "📝 詳細數據"])
+            
+            with tab1:
+                # 1. Sync & Focus over time
+                chart_data = df_hist[['obs_date', 'sync_score', 'focus_score']].set_index('obs_date')
+                st.line_chart(chart_data)
+                
+                # 2. Activity / Motion Score
+                st.caption("動作活躍度 (1-5) 變化")
+                st.bar_chart(df_hist[['obs_date', 'score']].set_index('obs_date'))
+                
+            with tab2:
+                # [v39 Fix] Rename columns for display
+                display_df = df_hist[['obs_date', 'activity_name', 'role', 'score', 'sync_score', 'focus_score', 'comment']].copy()
+                display_df.columns = ["日期", "活動名稱", "參與型態", "活躍度", "同步率", "專注度", "AI 總結評語"]
+                st.table(display_df) # [v47 Fix] Use st.table to allow text wrapping for long comments
+        else:
+            st.warning("此幼兒尚無詳細數據。")
+            
+    # Stop execution here to prevent Main UI from rendering below
+    st.stop()
 
 # [v13 New] 動作與視線規則檢測 (增加 跳躍/躺下)
 def detectaction_and_gaze(kpts, bbox=None): # 新增 bbox 參數用於長寬比判斷
@@ -621,10 +1185,13 @@ def detectaction_and_gaze(kpts, bbox=None): # 新增 bbox 參數用於長寬比�
         
     # 2. 蹲下 (Squat): 臀部 (11/12) 與 膝蓋 (13/14) 垂直距離縮短
     # ... (原有蹲下邏輯) ...
-    if kpts[11, 2] > 0.5 and kpts[15, 2] > 0.5 and kpts[5, 2] > 0.5:
+    # 2. 蹲下 (Squat): 臀部 (11/12) 與 膝蓋 (13/14) 垂直距離縮短
+    # [v29 Fix] Lower confidence threshold (0.5 -> 0.3) for crowded scenes where legs are occluded
+    if kpts[11, 2] > 0.3 and kpts[15, 2] > 0.3 and kpts[5, 2] > 0.3:
         leg_len = kpts[15, 1] - kpts[11, 1]
         body_len = kpts[15, 1] - kpts[5, 1] # 肩到腳
-        if body_len > 0 and (leg_len / body_len) < 0.35: # 腿佔比小於 35% -> 蹲
+        # [v29 Fix] Relax ratio (0.35 -> 0.45) to detect squats even from high angles
+        if body_len > 0 and (leg_len / body_len) < 0.45: 
             actions.append("蹲下")
             
     # [v13] 3. 躺下/地板動作 (Lying/Floor)
@@ -638,7 +1205,7 @@ def detectaction_and_gaze(kpts, bbox=None): # 新增 bbox 參數用於長寬比�
     # 邏輯：雙腳腳踝 (15/16) 的 Y 座標小於 (高於) 膝蓋 (13/14) 
     # 或者 腳踝非常接近膝蓋水平
     # 簡單版：雙腳騰空 (Ankle < Knee + offset)
-    if kpts[15, 2] > 0.5 and kpts[16, 2] > 0.5 and kpts[13, 2] > 0.5 and kpts[14, 2] > 0.5:
+    if kpts[15, 2] > 0.3 and kpts[16, 2] > 0.3 and kpts[13, 2] > 0.3 and kpts[14, 2] > 0.3:
         # 檢查左腳
         l_high = kpts[15, 1] < (kpts[13, 1] + 20) # 腳踝高於膝蓋附近
         r_high = kpts[16, 1] < (kpts[14, 1] + 20)
@@ -695,6 +1262,40 @@ observer_name = st.sidebar.text_input("觀察員姓名", "文禎")
 act_name = st.sidebar.text_input("活動名稱", "Walk and copy animal")
 act_date = st.sidebar.date_input("觀察日期", datetime.now())
 music_element = st.sidebar.text_input("音樂元素 (如：走停、快慢)", "走停")
+
+# [v47 New] Performance Mode
+perf_mode = st.sidebar.selectbox(
+    "⚗️ 分析效能模式", 
+    ["⚡ 標準模式 (Balanced)", "🚀 疾速模式 (Turbo)", "🎯 精準模式 (Pro)"],
+    index=0,
+    help="選擇分析頻率以平衡速度與精準度"
+)
+
+if "Turbo" in perf_mode:
+    frame_interval = 4
+    st.sidebar.caption("🚀 每 4 幀取樣 1 次 (極速，適合快速瀏覽)")
+elif "Pro" in perf_mode:
+    frame_interval = 1
+    st.sidebar.caption("🎯 每 1 幀都分析 (最慢，捕捉最細微動作)")
+else:
+    frame_interval = 2
+    st.sidebar.caption("⚡ 每 2 幀取樣 1 次 (預設，平衡速度與準確)")
+
+# [v27] Init DB
+try:
+    init_db()
+except Exception as e:
+    st.sidebar.error(f"DB Init Error: {e}")
+
+# [v27] Mode Selection
+mode = st.sidebar.radio("模式選擇", ["🚀 全功能分析", "🗄️ 歷史紀錄查閱"])
+
+
+
+if mode == "🗄️ 歷史紀錄查閱":
+    show_history_ui()
+    st.stop() # Stop execution to hide analysis UI
+
 # --- 3. 影片分析區 ---
 if not st.session_state.analysis_done:
     uploaded_file = st.file_uploader("📤 上傳影片 (分析時 ID 將自動歸 1)", type=["mp4", "mov"])
@@ -775,7 +1376,10 @@ if not st.session_state.analysis_done:
                         st.error(f"❌ 無法開啟影片檔案: {tfile_path}")
                     else:
                         # [v15 New] Video Writer for Replay
-                        fps = int(cap.get(cv2.CAP_PROP_FPS)) // 2 # [v21] Adjust FPS for frame skipping
+                        # [v47 Fix] Dynamic FPS based on Performance Mode
+                        fps = int(cap.get(cv2.CAP_PROP_FPS)) // frame_interval 
+                        if fps < 1: fps = 1
+                        st.session_state.effective_fps = fps # [v47] Persist for Post-Analysis
                         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                         
@@ -829,7 +1433,8 @@ if not st.session_state.analysis_done:
                             st.write(f"Debug Info: 讀取結束或讀取失敗 (Frame {f_idx})")
                             break
                         f_idx += 1
-                        if f_idx % 2 != 0: continue
+                        # [v47 Fix] Dynamic Frame Interval
+                        if f_idx % frame_interval != 0: continue
                         # [Fix] Reset annotated_frame to prevent stale images
                         if 'annotated_frame' in locals():
                             del annotated_frame
@@ -843,9 +1448,10 @@ if not st.session_state.analysis_done:
                             tracker_file = create_tracker_config()
                             # [PyInstaller Fix] Ensure tracker file exists or path is correct (created in current dir)
                             
-                            # [調整] 信心度門檻微調 (0.28 -> 0.25) 捕捉跳動中的模糊 ID (ID 16/18/20)
+                            # [調整] 信心度門檻微調 (0.25 -> 0.20) 捕捉更多模糊 ID
+                            # [調整] IoU (0.5 -> 0.7) 允許更多重疊 (Crowd Robustness)
                             # [v21] Cloud Optimization: imgsz=480
-                            results = model.track(frame, persist=True, verbose=False, conf=0.25, iou=0.5, tracker=tracker_file, imgsz=480)
+                            results = model.track(frame, persist=True, verbose=False, conf=0.20, iou=0.7, tracker=tracker_file, imgsz=480)
                            
                             # 檢查是否有偵測到東西
                             if results and len(results) > 0 and results[0].boxes is not None and results[0].boxes.id is not None:
@@ -994,11 +1600,42 @@ if not st.session_state.analysis_done:
                                         if keypoints_data is not None and len(keypoints_data) > i:
                                             try:
                                                 kpts = keypoints_data[i] # (17, 3)
+                                                
+                                                # [v42 Fix] Lying Down Detection to prevent False Positives
+                                                # User bug: "Lying on floor lifting legs" -> Detected as "Hands Up"
+                                                # Cause: Model might be confused or geometry check (Y-axis) is invalid for horizontal body.
+                                                # Solution: Check Body Aspect Ratio or Torso Orientation.
+                                                
+                                                # 1. Torso Orientation: Shoulders(5,6) vs Hips(11,12)
+                                                # If dy < dx, body is horizontal.
+                                                is_lying_down = False
+                                                if kpts[5][2]>0.5 and kpts[11][2]>0.5:
+                                                    dy = abs(kpts[5][1] - kpts[11][1])
+                                                    dx = abs(kpts[5][0] - kpts[11][0])
+                                                    if dy < dx * 0.8: # Horizontal
+                                                        is_lying_down = True
+                                                        
+                                                # 2. Bounding Box Aspect Ratio (Backup)
+                                                if not is_lying_down:
+                                                    w = x2 - x1
+                                                    h = y2 - y1
+                                                    if w > h * 1.2: 
+                                                        is_lying_down = True
+
+                                                # [v44 Improvement] Visualize Floor Action
+                                                if is_lying_down and not current_action:
+                                                    current_action = "地板動作"
+                                                    color = (255, 0, 255) # Magenta
+
                                                 # Check Hands Up (Wrists above Shoulders)
-                                                if (kpts[9][2] > 0.5 and kpts[5][2] > 0.5 and kpts[9][1] < kpts[5][1]) or \
-                                                   (kpts[10][2] > 0.5 and kpts[6][2] > 0.5 and kpts[10][1] < kpts[6][1]):
-                                                    current_action = "舉手"
-                                                    color = (0, 0, 255) # Red
+                                                # Only if NOT lying down
+                                                if not is_lying_down:
+                                                    if (kpts[9][2] > 0.5 and kpts[5][2] > 0.5 and kpts[9][1] < kpts[5][1]) or \
+                                                       (kpts[10][2] > 0.5 and kpts[6][2] > 0.5 and kpts[10][1] < kpts[6][1]):
+                                                        current_action = "舉手"
+                                                        color = (0, 0, 255) # Red
+                                                
+
                                                 
                                                 # [v22 New] Check Squat (Knees bent)
                                                 # Hip(11,12) -> Knee(13,14) -> Ankle(15,16)
@@ -1065,7 +1702,8 @@ if not st.session_state.analysis_done:
                                         action_map = {
                                             "舉手": "Hands Up",
                                             "蹲下": "Squat",
-                                            "跳躍": "Jump"
+                                            "跳躍": "Jump",
+                                            "地板動作": "Floor Action"
                                         }
                                         display_action = action_map.get(current_action, current_action)
                                         
@@ -1292,9 +1930,10 @@ if not st.session_state.analysis_done:
                 else:
                     st.warning("⚠️ 雖然分析完成，但沒有產生任何畫面預覽（可能是沒偵測到任何物件或影片讀取失敗）。")
                 
-                if st.button("✅ 確認並產出觀察報告"):
-                    st.session_state.analysis_done = True
-                    st.rerun()
+                # [v46 Fix] Auto-confirm to prevent data loss on mode switch
+                st.success("✅ 分析完成！正在生成報告...")
+                st.session_state.analysis_done = True
+                st.rerun()
 
             except Exception as e:
                 logging.error(f"Post-processing crashing: {e}")
@@ -1350,11 +1989,10 @@ else:
         id_map_rev = {} # 顯示名稱 -> 真實 ID
         
         for idx, m in enumerate(s_ids, 1):
-            # 取得原始 ID
-            feat = st.session_state.id_features.get(m, {})
-            original_id = feat.get("original_id", m)
-            
-            label = f"ID_{idx} (原:{original_id})"
+            # [v40 Fix] Use Raw ID directly to match Video Overlay
+            # User confusion: Video says ID 9, Table says ID 7 (Original 9).
+            # Solution: Table should say ID 9.
+            label = f"ID_{m}"
             id_options.append(label)
             id_map_rev[label] = m
 
@@ -1377,10 +2015,11 @@ else:
             feat = st.session_state.id_features.get(m, {"clothing": "分析中"})
             if isinstance(feat, str): feat = {"clothing": feat}
             
-            # [v8 Fix] 從 features 中讀取原始 ID (如果有的話)
-            original_id = m
-            if "original_id" in feat:
-                original_id = feat["original_id"]
+            # [v40 Fix] Use Raw ID for Label
+            original_id = m # We rely on m directly now
+            # if "original_id" in feat: original_id = feat["original_id"] # Legacy logic ignored for clarity
+            
+            label = f"ID_{m}" # Consistent Label ID_9
 
             # 計算動態評分
             pos_history = st.session_state.id_positions.get(m, [])
@@ -1413,11 +2052,26 @@ else:
                             # This handles cases where function returns 0-1 instead of 0-100
                             sync_score = float(raw_r)
                             if 0 < sync_score <= 1.0:
-                                sync_score *= 100.0
-                                logging.info(f"Debug Sync: Auto-scaled {raw_r} to {sync_score}")
+                                sync_score *= 100
+                            sync_score = round(sync_score, 1)
+                            # logging.info(f"Debug Sync: Auto-scaled {raw_r} to {sync_score}")
                         else:
                             sync_score = 0.0
-                except:
+
+                        if teacher_id is not None and m != teacher_id:
+                            # Use motion logs (energy) for cross-correlation
+                            student_log = st.session_state.id_motion_log.get(m, [])
+                            teacher_log = st.session_state.id_motion_log.get(teacher_id, [])
+                            # [v47 Fix] Use effective FPS for accurate lag time
+                            eff_fps = st.session_state.get("effective_fps", 30)
+                            temp_corr, lag_sec = analyze_temporal_sync(student_log, teacher_log, fps=eff_fps)
+                        
+                        # [v26 Add] Store for Table
+                        feat['temp_lag'] = lag_sec
+                        feat['temp_corr'] = temp_corr
+                        
+                except Exception as e:
+                    logging.error(f"Sync error for {m}: {e}")
                     sync_score = 0.0
             
             # [v18.9 Fix] Final Hard Override for Teacher
@@ -1436,18 +2090,18 @@ else:
             action_counts = st.session_state.id_actions.get(m, {})
             valid_tags = []
             
+
             # 優先級 sorting
             priority = ["跳躍", "地板動作", "舉手", "蹲下", "抬腿", "側臉", "專注"] 
             
             for tag in priority:
-                if action_counts.get(tag, 0) > 10: # 持續 0.3秒以上 (v13: 降低門檻捕捉短暫跳躍)
+                if action_counts.get(tag, 0) > 3: # [v28 Fix] Lower threshold from 10 to 3 frames
                     valid_tags.append(tag)
             
             if valid_tags:
                 feat_enhance = ", ".join(valid_tags)
                 
             # [v14] 生成 AI 評語
-            # 取出 gaze 狀態 (如果 valid_tags 有 '專注' 或 '側臉')
             gaze_status = "一般"
             if "專注" in valid_tags: gaze_status = "專注"
             if "側臉" in valid_tags: gaze_status = "側臉"
@@ -1487,11 +2141,10 @@ else:
             role = "獨立觀察 (Independent)" 
             
             # Hierarchy of Roles
-            # [v22 Fix] "Socially Active" now requires Motion >= 3 to avoid stationary observers being labeled Active
             if interaction_count >= 30 and score >= 3:
                 role = "社交活躍 (Active)"
             elif interaction_count >= 30:
-                role = "靜態互動 (Passive)" # New role for stationary but crowded/interacting kids
+                role = "靜態互動 (Passive)"
             elif focus_score >= 60:
                 role = "專注跟隨 (Focused)"
             elif sync_score is not None and sync_score >= 80:
@@ -1505,17 +2158,19 @@ else:
             pure_actions = [tag for tag in valid_tags if tag not in ["專注", "側臉"]]
             
             # [v20 Refine] Use Expert System
-            # ai_comment = generate_ai_comment(score, sync_score, pure_actions, gaze_status)
-            ai_comment = generate_expert_comment(score, sync_score, focus_score, role, valid_tags)
-
+            context = {
+                'avg_focus': 50, 
+                'avg_motion': 3,
+                'temp_corr': feat.get('temp_corr', 0),
+                'lag_sec': feat.get('temp_lag', 0)
+            }
             
-            # if score >= 4:
-            #     feat_enhance = "高能量/創意展現?"
-            # if sync_score is not None and sync_score < 40 and m != teacher_id:
-            #     feat_enhance += " (未跟隨指令?)"
+            ai_comment = generate_expert_comment(score, sync_score if sync_score else 0, 0, feat.get("role", "Unknown"), valid_tags, context)
 
-            # [v21 Upgrade] Phase 1: Store Raw Data, Generate Comment Later
-            # We need class stats first, so we use a placeholder now.
+            # [v21 Upgrade] Phase 1: Store Raw Data
+            lag_display = "-"
+            if feat.get('temp_lag', 0) and abs(feat.get('temp_lag', 0)) > 0.1:
+                lag_display = f"{feat.get('temp_lag', 0):.2f}s"
             
             df_list.append({
                 "序號": idx, 
@@ -1524,27 +2179,27 @@ else:
                 "特徵補強 (圖案/熊/亮片)": None, 
                 "AI 觀察判定 (1-5)": score,
                 "跟隨指令 (同步率%)": float(f"{sync_score:.0f}") if sync_score is not None else 0, 
+                "時序延遲 (Lag)": lag_display, 
                 "專注度(%)": focus_score, 
                 "參與型態": role,        
                 "動作檢測 (舉手、側臉)": feat_enhance, 
-                "AI 總結評語": "", # Placeholder for Phase 2
+                "AI 總結評語": "", # Placeholder 
                 "教師評分 (1-5)": None,
                 "教師評語": None,
-                # [v21] Hidden fields for Phase 2 Contextual Analysis
                 "_raw_score": score,
                 "_raw_sync": sync_score,
                 "_raw_focus": focus_score,
                 "_raw_role": role,
-                "_raw_tags": valid_tags
+                "_raw_tags": valid_tags,
+                "_raw_temp_corr": feat.get('temp_corr', 0),
+                "_raw_temp_lag": feat.get('temp_lag', 0)
             })
        
         # 顯示資料編輯器
         st.caption("💡 提示：AI 評分基於「動作活躍度」 (長時間靜止=1分，大幅活動=5分)。")
         
         # 轉換為 DataFrame 並調整欄位順序
-        # [v21 Upgrade] Phase 2: Contextual Comments - Calculate Class Stats & Update
         if df_list:
-            # Extract raw values for stats
             scores = [d["_raw_score"] for d in df_list if d["_raw_score"] is not None]
             focuses = [d["_raw_focus"] for d in df_list if d["_raw_focus"] is not None]
             
@@ -1555,66 +2210,141 @@ else:
             
             # Update each student with context-aware comment
             for d in df_list:
-                # Skip Teacher special role handling if needed, but here we just generate standard comment
+                context = {
+                   'temp_corr': d.get('_raw_temp_corr', 0),
+                   'lag_sec': d.get('_raw_temp_lag', 0)
+                }
+                context.update(class_stats)
+                
                 comment = generate_expert_comment(
                     d["_raw_score"], d["_raw_sync"], d["_raw_focus"], 
                     d["_raw_role"], d["_raw_tags"],
-                    class_stats=class_stats
+                    class_stats=context
                 )
                 d["AI 總結評語"] = comment
                 
-                # Cleanup raw fields to keep dataframe clean
-                for k in ["_raw_score", "_raw_sync", "_raw_focus", "_raw_role", "_raw_tags"]:
+                # Cleanup raw fields
+                for k in ["_raw_score", "_raw_sync", "_raw_focus", "_raw_role", "_raw_tags", "_raw_temp_corr", "_raw_temp_lag"]:
                     d.pop(k, None)
 
-        # 轉換為 DataFrame 並調整欄位順序
+        # 轉換為 DataFrame 
         df = pd.DataFrame(df_list)
         
-        # [v20.2 Sort] Sort by ID number for cleaner table
-        # Extract number from "ID_X (原:Y)"
+        # [v20.2 Sort] Sort by ID number
         if not df.empty:
             df['sort_key'] = df['幼兒 ID'].apply(lambda x: int(x.split(' ')[0].split('_')[1]) if '_' in x else 999)
             df = df.sort_values('sort_key').drop(columns=['sort_key'])
         
-        # [v20.4 Update] Required Cols with New Order
+        # [v20.4 Update] Required Cols
         required_cols = ["序號", "幼兒 ID", "AI 服裝特徵", "特徵補強 (圖案/熊/亮片)", "AI 觀察判定 (1-5)", "跟隨指令 (同步率%)", "專注度(%)", "參與型態", "動作檢測 (舉手、側臉)", "AI 總結評語", "教師評分 (1-5)", "教師評語"]
         
         if df.empty:
             df = pd.DataFrame(columns=required_cols)
         else:
-            # 確保所有欄位都存在 (避免之前的資料沒有新欄位)
             for col in required_cols:
                 if col not in df.columns:
-                    df[col] = None # 補上缺失欄位
+                    df[col] = None 
             df = df[required_cols]
 
-        # 設定欄位格式 (隱藏預設 index，並將 ID 欄位設為文字避免逗號)
-        # [v8 Fix] 調整欄位寬度以符合使用者需求 (避免左右滑動)
+        # [v31 Fix] Persistent Naming Logic using Session State
+        if 'custom_name_map' not in st.session_state:
+            st.session_state.custom_name_map = {}
+
+        # Preserve the Original Raw ID for mapping (Hidden Column)
+        # We need a column that stays constant even if "幼兒 ID" is edited.
+        # "幼兒 ID" acts as the Display/Edit column.
+        # "Raw_ID" acts as the Key.
+        
+        # 1. Inject Raw_ID for tracking
+        # 1. Inject Raw_ID for tracking
+        if not df.empty:
+            # Re-extract raw ID from the "幼兒 ID" string if needed, or assume it's unique enough
+            # Current "ID_X (原:Y)" is unique per session run (until restart)
+            # [v45 Fix] Extract Simple Key "ID_X" for consistent mapping
+            # This ensures that even if display name is complex, the key remains stable.
+            df['Raw_ID'] = df['幼兒 ID'].apply(lambda x: x.split(" ")[0]) if not df.empty else []
+            
+            # 2. Apply existing map to Display Column
+            # If Raw_ID is in map, update "幼兒 ID" to show the Custom Name
+            # [v45 Fix] Logic: If key exists, use it; else keep original display (w/ suffix)
+            def apply_name(row):
+                key = row['Raw_ID']
+                return st.session_state.custom_name_map.get(key, row['幼兒 ID'])
+            
+            df['幼兒 ID'] = df.apply(apply_name, axis=1)
+
+        # 設定欄位格式
         # [v19 Fix] Restore st.data_editor call
+        # [v36 Fix] Define Callback for Persistent Renaming
+        def update_names_callback():
+            """
+            Callback to handle name changes immediately before rerun.
+            Uses raw index to map back to ID key because data_editor uses 0-based index.
+            """
+            # Access the editor state directly
+            editor_state = st.session_state.get("data_editor_v31_final", {})
+            edited_rows = editor_state.get("edited_rows", {})
+            
+            if not edited_rows:
+                return
+
+            # Reconstruct the ID list to find the key
+            # Must match the sort order used in DF construction
+            if 'final_id_list' in st.session_state:
+                s_ids = st.session_state.final_id_list
+            else:
+                s_ids = sorted(list(st.session_state.id_list))
+            
+            # [Fix] Missing Loop restored
+            for idx, changes in edited_rows.items():
+                if "幼兒 ID" in changes:
+                    new_name = changes["幼兒 ID"]
+                    # Find the Raw Key (e.g. "ID_9")
+                    try:
+                        # idx from data_editor is the row index in the displayed DF
+                        m = s_ids[int(idx)] 
+                        raw_key = f"ID_{m}"
+                        
+                        # Update Map
+                        st.session_state.custom_name_map[raw_key] = new_name
+                    except IndexError:
+                        pass # Should not happen if sync is correct
+
         edited_df = st.data_editor(
             df, 
             use_container_width=True,
             column_config={
+                "Raw_ID": None, # Hide the boolean/key column
                 "序號": st.column_config.NumberColumn("序號", format="%d", width=40, disabled=True), 
-                "專注度(%)": st.column_config.ProgressColumn("專注度", min_value=0, max_value=100, format="%d%%", width=80), # [v19]
-                "參與型態": st.column_config.TextColumn("參與型態", width=120), # [v19.2 Renamed]
+                "專注度(%)": st.column_config.ProgressColumn("專注度", min_value=0, max_value=100, format="%d%%", width=80), 
+                "參與型態": st.column_config.TextColumn("參與型態", width=120), 
                 "幼兒 ID": st.column_config.TextColumn( 
-                    "幼兒 ID",
-                    width=100, 
-                    disabled=True
+                    "幼兒 ID (可修改姓名)", 
+                    width=150, 
+                    disabled=False,
+                    help="點擊兩下修改姓名，系統會自動記憶 (直到重整網頁)"
                 ),
                 "AI 服裝特徵": st.column_config.TextColumn("AI 服裝特徵", width=300), 
-                "特徵補強 (圖案/熊/亮片)": st.column_config.TextColumn("特徵補強", width=100), # [v20.5 Reduced width]
+                "特徵補強 (圖案/熊/亮片)": st.column_config.TextColumn("特徵補強", width=100), 
                 "AI 觀察判定 (1-5)": st.column_config.NumberColumn("AI 評分", width=80), 
                 "跟隨指令 (同步率%)": st.column_config.NumberColumn("同步率", format="%.0f", width=80), 
-                "動作檢測 (舉手、側臉)": st.column_config.TextColumn("動作檢測", width=150), # [v20.4 Moved & Renamed]
-                "AI 總結評語": st.column_config.TextColumn("AI 總結評語", width=400), 
+                "動作檢測 (舉手、側臉)": st.column_config.TextColumn("動作檢測", width=150), 
+                "AI 總結評語": st.column_config.TextColumn("AI 總結評語", width=600), 
                 "教師評分 (1-5)": st.column_config.NumberColumn("教師評分", width=80), 
                 "教師評語": st.column_config.TextColumn("教師評語", width=200),
             },
             hide_index=True,
-            key="data_editor_v20_5" # [Request] Force update
+            key="data_editor_v31_final", # Unique key
+            on_change=update_names_callback # [v36] Bind callback
         )
+        
+        # [v36] Removed old manual diff logic (lines 2077-2100) as callback handles it robustly.
+        # Check if we need to force rerun?
+        # Streamlit automatically reruns after callback.
+        # Since logic updates state before rerun, the next run sees updated map.
+        # df is rebuilt with map -> Editor shows new name.
+        # Perfect.
+
         
         # [v19 New] Display Social Graph
         st.write("---")
@@ -1626,11 +2356,50 @@ else:
                                             {m: f"{m}" for m in st.session_state.id_list})
                 # [v20.11 Refine] Larger Display Width (1100px)
                 # [Fix] Convert BGR to RGB for correct color display in Streamlit
+                # Display Graph
                 graph_img_rgb = cv2.cvtColor(graph_img, cv2.COLOR_BGR2RGB)
-                st.image(graph_img_rgb, caption="社交圖譜與核心人物 (粗線=互動頻率)", width=1100)
+                # [v35 Fix] Removed duplicate st.image call and updated caption per user request
+                st.image(graph_img_rgb, use_container_width=True, caption="🔴紅色=社交核心 | 🔵藍色=一般 | 線條粗細=互動頻率")
                 
-                # [v21.2 Add] Social Graph Explanation
-                st.info("""
+                # [v34 New] Interaction Details List to clarify connections
+                with st.expander("詳細互動清單 (Interaction Details)"):
+                    if 'id_interactions' in st.session_state and st.session_state.id_interactions:
+                        # Sort by count
+                        sorted_inters = sorted(st.session_state.id_interactions.items(), key=lambda x: x[1], reverse=True)
+                        
+                        # Get ID map for names
+                        id_name_map = {}
+                        if not df.empty:
+                            for _, row in df.iterrows():
+                                r_id_col = row.get('Raw_ID', row.get('幼兒 ID'))
+                                try:
+                                    if "ID_" in str(r_id_col):
+                                        p = str(r_id_col).split("ID_")[1].split(" ")[0]
+                                        int_id = int(p)
+                                        id_name_map[int_id] = row['幼兒 ID'] 
+                                except:
+                                    pass
+                        
+                        count_shown = 0
+                        fps_approx = 30 # Assumption
+                        for (id1, id2), count in sorted_inters:
+                            if count >= 2: # Threshold
+                                name1 = id_name_map.get(id1, f"ID_{id1}")
+                                name2 = id_name_map.get(id2, f"ID_{id2}")
+                                
+                                # [v35 Fix] Convert frame count to seconds for intuition
+                                # "100 interactions" -> "3.3 seconds"
+                                duration_sec = count / fps_approx
+                                
+                                st.write(f"🔗 **{name1}** ↔ **{name2}** : 互動約 **{duration_sec:.1f} 秒** (強度: {count})")
+                                count_shown += 1
+                        
+                        if count_shown == 0:
+                            st.info("尚無顯著互動 (次數 < 2)。")
+                    else:
+                        st.info("尚無互動資料。")
+
+                st.markdown("""
                 **📖 如何解讀社交圖譜 (How to Read)**
                 *   **🔵 藍色圓圈 (Blue Nodes)**: 一般幼兒 (ID)。
                 *   **🔴 紅色圓圈 (Red Nodes)**: 社交核心人物 (互動頻率高於平均)。
@@ -1719,16 +2488,35 @@ else:
 
             st.session_state.excel_ready_data = out.getvalue()
             st.success("🎉 Excel 數據已成功同步！請點擊下方按鈕下載。")
-        if 'excel_ready_data' in st.session_state:
-            st.download_button(
-                label="📥 下載 Excel 正式觀察報表",
-                data=st.session_state.excel_ready_data,
-                file_name=f"HMEAYC_Record_{act_date}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-    if st.button("🔙 重新分析 (清空目前的報表)"):
-        logging.info("Resetting analysis...")
-        st.session_state.clear()
-        gc.collect()
-        st.rerun()
+        
+        # [v27] Action Buttons Layout
+        col_dl, col_db, col_reset = st.columns([2, 2, 2])
+        
+        with col_dl:
+            if 'excel_ready_data' in st.session_state:
+                st.download_button(
+                    label="📥 下載 Excel 正式觀察報表",
+                    data=st.session_state.excel_ready_data,
+                    file_name=f"HMEAYC_Record_{act_date}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+                
+        with col_db:
+             if st.button("💾 儲存至歷史資料庫 (Save to DB)"):
+                 # [v37 Fix] Use persistent filename from session_state
+                 # [v32 Update] Handle return tuple (success, obs_id)
+                 target_filename = st.session_state.get("current_fn", "unknown_video.mp4")
+                 success, msg_or_id = save_analysis_to_db(observer_name, act_name, target_filename, edited_df)
+                 
+                 if success:
+                     st.success(f"✅ 資料已成功儲存！(紀錄 ID: {msg_or_id})")
+                     st.info("💡 若您再次點擊儲存，系統將會「更新」此筆紀錄，而不會產生重複資料。")
+                 else:
+                     st.error(f"❌ 儲存失敗: {msg_or_id}")
 
+        with col_reset:
+            # [v27.2] Reset Button (Clear Cache)
+            if st.button("🔄 清除暫存並重新分析 (Reset)"):
+                for key in list(st.session_state.keys()):
+                    del st.session_state[key]
+                st.rerun()
