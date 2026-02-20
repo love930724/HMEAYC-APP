@@ -1329,8 +1329,8 @@ def get_color_histogram(img):
     cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
     return hist
 
-# [v21.5.3] Absolute Stability Release
-st.sidebar.caption("Version: v21.5.3-AbsoluteFix")
+# [v21.5.4] Final Recovery Release
+st.sidebar.caption("Version: v21.5.4-FinalRecovery")
 
 # [v65 New] Callback to reset analysis state when tracking settings change
 def reset_analysis_state():
@@ -2254,17 +2254,26 @@ st.markdown("---")
 # 使用者要求：按鈕在下方，點擊後展開播放器，可重複觀看
 st.markdown("---")
 # [v18.7 Fix] Always show video after analysis
-# [v21.5.3 Fix] Play video with binary fallback for Cloud compatibility
-if 'video_output_path' in st.session_state and os.path.exists(st.session_state.video_output_path):
-    st.info(f"🎥 鑑識影片回放 (已優化畫質)")
-    try:
-        # Priority 1: Use direct file stream to ensure playback in Cloud environments
-        with open(st.session_state.video_output_path, "rb") as video_file:
-            video_bytes = video_file.read()
-            st.video(video_bytes)
-    except Exception as e_video:
-        # Priority 2: Fallback to path if stream fails
-        st.video(st.session_state.video_output_path)
+# [v21.5.4 Fix] Robust Video Player with Debug Info
+if 'video_output_path' in st.session_state and st.session_state.video_output_path:
+    target_video = st.session_state.video_output_path
+    if os.path.exists(target_video):
+        v_size = os.path.getsize(target_video) / (1024 * 1024)
+        st.info(f"🎥 鑑識影片已就緒 ({v_size:.1f}MB)")
+        
+        try:
+            # Always attempt binary stream for Cloud bypass
+            with open(target_video, "rb") as f_v:
+                v_data = f_v.read()
+                if len(v_data) > 0:
+                    st.video(v_data)
+                else:
+                    st.error("❌ 影片數據為空，請重新分析。")
+        except Exception as e_v_play:
+            st.warning(f"⚠️ 串流播放失敗，嘗試直接讀取路徑: {e_v_play}")
+            st.video(target_video)
+    else:
+        st.error(f"❌ 找不到影片檔案: {target_video}")
 
     # [v18.8 Fix] Download Button
     with open(st.session_state.video_output_path, "rb") as f:
