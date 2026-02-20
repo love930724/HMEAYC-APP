@@ -2138,8 +2138,11 @@ if not st.session_state.analysis_done:
                             annotated_frame = frame
 
                         if 'st_frame' in locals() and annotated_frame is not None:
-                            frame_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-                            st_frame.image(frame_rgb)
+                            # [v21.5.4] Optimized UI Update: Throttle refresh to every 10 processed segments for Cloud Stability
+                            # Too many updates can clog the websocket in a low-bandwidth cloud environment.
+                            if (f_idx // frame_interval) % 10 == 0:
+                                frame_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+                                st_frame.image(frame_rgb)
 
                         # [v21.4 Fix] ALWAYS write frame to output video, even if no detection
                         # This ensures the output video has the correct length and sync.
