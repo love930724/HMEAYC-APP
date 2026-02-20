@@ -1329,8 +1329,8 @@ def get_color_histogram(img):
     cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
     return hist
 
-# [v21.5] Cloud Stability Release
-st.sidebar.caption("Version: v21.5-CloudReady")
+# [v21.5.1] Hotfix Release
+st.sidebar.caption("Version: v21.5.1-Hotfix")
 
 # [v65 New] Callback to reset analysis state when tracking settings change
 def reset_analysis_state():
@@ -2160,6 +2160,32 @@ if not st.session_state.analysis_done:
                     holistic_model.close()
                 if out_video is not None and out_video.isOpened():
                     out_video.release() # Release writer
+                    
+                # [v21.5.1 Hotfix] Move conversion BEFORE rerun to avoid race condition
+                if os.path.exists(output_path):
+                    converted_path = os.path.abspath("obs_video_h264.mp4")
+                    st.info("🔄 正在轉換影片格式 (H.264) 以支援網頁播放...")
+                    
+                    import shutil
+                    import subprocess
+                    if shutil.which("ffmpeg"):
+                        try:
+                            # Use ultrafast and crf 28 for cloud performance
+                            cmd = [
+                                "ffmpeg", "-y", "-i", output_path,
+                                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+                                "-f", "mp4", converted_path
+                            ]
+                            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90)
+                            if os.path.exists(converted_path) and os.path.getsize(converted_path) > 100:
+                                st.session_state.video_output_path = converted_path
+                            else:
+                                st.session_state.video_output_path = output_path
+                        except Exception as e:
+                            logging.warning(f"FFmpeg conversion failed: {e}")
+                            st.session_state.video_output_path = output_path
+                    else:
+                        st.session_state.video_output_path = output_path
 
                 st_progress.empty() # 清除進度條
 
@@ -2195,57 +2221,8 @@ if not st.session_state.analysis_done:
                     except:
                         pass
 
-                # [v23 Fix] Convert to H.264 using FFmpeg for Browser Compatibility
-                if out_video is not None:
-                    out_video.release() # Ensure closed
-
-                    if os.path.exists(output_path):
-                        # Define converted path
-                        converted_path = os.path.abspath("obs_video_h264.mp4")
-
-                        st.info("🔄 正在轉換影片格式 (H.264) 以支援網頁播放...")
-
-                        # FFmpeg command: -y (overwrite), -i input, -vcodec libx264, output
-                        # Note: Streamlit Cloud has ffmpeg installed via packages.txt
-                        import subprocess
-                        import shutil
-
-                        # Check if ffmpeg is available
-                        if shutil.which("ffmpeg"):
-                            try:
-                                command = [
-                                    "ffmpeg", "-y", 
-                                    "-i", output_path,
-                                    "-vcodec", "libx264",
-                                    "-f", "mp4",
-                                    converted_path
-                                ]
-                                # Use a timeout of 60s
-                                subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
-
-                                # Update session path to converted file
-                                st.session_state.video_output_path = converted_path
-                            except Exception as e:
-                                logging.warning(f"FFmpeg conversion failed: {e}")
-                                # [v21.5 Fix] Robust Video Encoding for Cloud
-                                try:
-                                    # Use explicit full path for ffmpeg if possible, or just log results
-                                    st.info("🔄 正在進行 H.264 影像轉碼以相容網頁播放...")
-                                    temp_out_path = output_path
-                                    h264_out_path = converted_path
-                                    os.system(f'ffmpeg -y -i "{temp_out_path}" -c:v libx264 -preset ultrafast -crf 28 "{h264_out_path}"')
-                                    
-                                    if os.path.exists(h264_out_path) and os.path.getsize(h264_out_path) > 100:
-                                        st.session_state.video_output_path = h264_out_path
-                                    else:
-                                        st.warning("⚠️ H.264 轉碼失敗或檔案過小，將嘗試直接播放原始轉換軌。")
-                                        st.session_state.video_output_path = temp_out_path
-                                except Exception as e_ffmpeg_fallback:
-                                    st.error(f"❌ 影像轉碼發生錯誤: {e_ffmpeg_fallback}")
-                                    st.session_state.video_output_path = output_path
-                        else:
-                            logging.info("FFmpeg not found. Skipping conversion.")
-                            st.session_state.video_output_path = output_path
+                # [v21.5.1 Fix] Clean up legacy conversion block from finally
+                pass
 
 
 # [v66] The transition results block has been consolidated into the analysis completion block above.
