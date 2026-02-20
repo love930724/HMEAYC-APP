@@ -1329,8 +1329,8 @@ def get_color_histogram(img):
     cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
     return hist
 
-# [v21.5.2] Stability Release
-st.sidebar.caption("Version: v21.5.2-FullRes")
+# [v21.5.3] Absolute Stability Release
+st.sidebar.caption("Version: v21.5.3-AbsoluteFix")
 
 # [v65 New] Callback to reset analysis state when tracking settings change
 def reset_analysis_state():
@@ -2163,7 +2163,8 @@ if not st.session_state.analysis_done:
                     
                 # [v21.5.1 Hotfix] Move conversion BEFORE rerun to avoid race condition
                 if os.path.exists(output_path):
-                    converted_path = os.path.abspath("obs_video_h264.mp4")
+                    # [v21.5.3] Use relative path to avoid container mapping issues
+                    converted_path = "obs_video_h264.mp4"
                     st.info("🔄 正在轉換影片格式 (H.264) 以支援網頁播放...")
                     
                     import shutil
@@ -2253,9 +2254,17 @@ st.markdown("---")
 # 使用者要求：按鈕在下方，點擊後展開播放器，可重複觀看
 st.markdown("---")
 # [v18.7 Fix] Always show video after analysis
+# [v21.5.3 Fix] Play video with binary fallback for Cloud compatibility
 if 'video_output_path' in st.session_state and os.path.exists(st.session_state.video_output_path):
-    st.info(f"🎥 鑑識影片回放 ({st.session_state.video_output_path})")
-    st.video(st.session_state.video_output_path)
+    st.info(f"🎥 鑑識影片回放 (已優化畫質)")
+    try:
+        # Priority 1: Use direct file stream to ensure playback in Cloud environments
+        with open(st.session_state.video_output_path, "rb") as video_file:
+            video_bytes = video_file.read()
+            st.video(video_bytes)
+    except Exception as e_video:
+        # Priority 2: Fallback to path if stream fails
+        st.video(st.session_state.video_output_path)
 
     # [v18.8 Fix] Download Button
     with open(st.session_state.video_output_path, "rb") as f:
