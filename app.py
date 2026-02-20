@@ -1329,8 +1329,8 @@ def get_color_histogram(img):
     cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
     return hist
 
-# [v21.5.4] Final Recovery Release
-st.sidebar.caption("Version: v21.5.4-FinalRecovery")
+# [v21.5.7] Persistent Save Release
+st.sidebar.caption("Version: v21.5.7-SaveFix")
 
 # [v65 New] Callback to reset analysis state when tracking settings change
 def reset_analysis_state():
@@ -1382,6 +1382,13 @@ else:
     frame_interval = 2
     st.sidebar.caption("⚡ 每 2 幀取樣 1 次 (預設，平衡速度與準確)")
 
+st.sidebar.markdown("---")
+# [v21.5.5] Cloud Performance Booster Toggle
+cloud_booster = st.sidebar.toggle(
+    "🚀 雲端效能優化 (加速 50%)", 
+    value=True, 
+    help="關閉分析時的『即時預覽畫面』，這能節省大量系統資源，讓分析更流暢，特別適合在網頁版上使用。"
+)
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🎯 追蹤目標設定 (全模式通用)")
 
@@ -2138,11 +2145,21 @@ if not st.session_state.analysis_done:
                             annotated_frame = frame
 
                         if 'st_frame' in locals() and annotated_frame is not None:
-                            # [v21.5.4] Optimized UI Update: Throttle refresh to every 10 processed segments for Cloud Stability
-                            # Too many updates can clog the websocket in a low-bandwidth cloud environment.
-                            if (f_idx // frame_interval) % 10 == 0:
-                                frame_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-                                st_frame.image(frame_rgb)
+                            # [v21.5.5] Optimized UI Update: Only show preview if Booster is OFF
+                            if not cloud_booster:
+                                # [v21.5.6] Aggressive UI Throttling: every 20 segments
+                                if (f_idx // frame_interval) % 20 == 0:
+                                    # [v21.5.6] Resolution Scaling: Resize to 480px width for Cloud
+                                    h, w = annotated_frame.shape[:2]
+                                    new_w = 480
+                                    new_h = int(h * (new_w / w))
+                                    small_frame = cv2.resize(annotated_frame, (new_w, new_h))
+                                    frame_rgb = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+                                    st_frame.image(frame_rgb)
+                            else:
+                                # Booster is ON: Only update status text periodically
+                                if (f_idx // frame_interval) % 30 == 0:
+                                    st_frame.write(f"🚀 Turbo 加速中：正在全力辨識數據... ({progress_pct:.0f}%)")
 
                         # [v21.4 Fix] ALWAYS write frame to output video, even if no detection
                         # This ensures the output video has the correct length and sync.
@@ -2712,14 +2729,15 @@ else:
         # Current "ID_X (原:Y)" is unique per session run (until restart)
         # [v45 Fix] Extract Simple Key "ID_X" for consistent mapping
         # This ensures that even if display name is complex, the key remains stable.
-        df['Raw_ID'] = df['幼兒 ID'].apply(lambda x: x.split(" ")[0]) if not df.empty else []
+        # [v21.5.7 Fix] Unified Raw_ID for stable mapping
+        # Extract the stable detection ID (e.g., ID_11) from the original label
+        df['Raw_ID'] = df['幼兒 ID'].apply(lambda x: x.split(" ")[0] if isinstance(x, str) else "")
 
-        # 2. Apply existing map to Display Column
-        # If Raw_ID is in map, update "幼兒 ID" to show the Custom Name
-        # [v45 Fix] Logic: If key exists, use it; else keep original display (w/ suffix)
+        # Apply existing names to Display Column
         def apply_name(row):
             key = row['Raw_ID']
-            return st.session_state.custom_name_map.get(key, row['幼兒 ID'])
+            val = st.session_state.custom_name_map.get(key, row['幼兒 ID'])
+            return val
 
         df['幼兒 ID'] = df.apply(apply_name, axis=1)
 
@@ -2728,37 +2746,26 @@ else:
     # [v36 Fix] Define Callback for Persistent Renaming
     def update_names_callback():
         """
-        Callback to handle name changes immediately before rerun.
-        Uses raw index to map back to ID key because data_editor uses 0-based index.
+        Callback to handle name changes by looking up stable Raw_ID from current dataframe.
         """
-        # Access the editor state directly
         editor_state = st.session_state.get("data_editor_v31_final", {})
         edited_rows = editor_state.get("edited_rows", {})
-
         if not edited_rows:
             return
 
-        # Reconstruct the ID list to find the key
-        # Must match the sort order used in DF construction
-        if 'final_id_list' in st.session_state:
-            s_ids = st.session_state.final_id_list
-        else:
-            s_ids = sorted(list(st.session_state.id_list))
-
-        # [Fix] Missing Loop restored
-        for idx, changes in edited_rows.items():
+        for row_idx_str, changes in edited_rows.items():
             if "幼兒 ID" in changes:
-                new_name = changes["幼兒 ID"]
-                # Find the Raw Key (e.g. "ID_9")
                 try:
-                    # idx from data_editor is the row index in the displayed DF
-                    m = s_ids[int(idx)] 
-                    raw_key = f"ID_{m}"
-
-                    # Update Map
+                    row_idx = int(row_idx_str)
+                    # Directly look up the stable key from the current dataframe
+                    raw_key = df.iloc[row_idx]['Raw_ID']
+                    new_name = changes["幼兒 ID"]
+                    
+                    # Update global naming map
                     st.session_state.custom_name_map[raw_key] = new_name
-                except IndexError:
-                    pass # Should not happen if sync is correct
+                    logging.info(f"Renamed {raw_key} to {new_name}")
+                except Exception as e:
+                    logging.error(f"Rename Callback Error: {e}")
 
     edited_df = st.data_editor(
         df, 
