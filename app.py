@@ -94,12 +94,16 @@ def save_analysis_to_db(observer, activity, video, df):
         obs_id = st.session_state.get('current_obs_id', None)
 
         if obs_id:
-            # Update mode: Delete old records first (simplest way to handle full refresh)
-            # Or Update Master Record timestamp
+            # Update mode: Update Master Record timestamp
             c.execute("UPDATE observations SET timestamp=CURRENT_TIMESTAMP, is_deleted=0 WHERE id=?", (obs_id,))
-
-            # Delete details (Hard delete details is fine, assuming we re-insert)
-            c.execute("DELETE FROM records WHERE obs_id=?", (obs_id,))
+            
+            # [v21.5 Fix] Instead of deleting ALL, only delete the IDs we are about to re-insert
+            # This prevents a single-target report from wiping out the whole group record.
+            ids_to_update = df["幼兒 ID"].unique().tolist()
+            if ids_to_update:
+                placeholders = ', '.join(['?'] * len(ids_to_update))
+                query = f"DELETE FROM records WHERE obs_id=? AND student_id IN ({placeholders})"
+                c.execute(query, [obs_id] + ids_to_update)
         else:
             # Insert Master Record
             date_str = datetime.now().strftime("%Y-%m-%d")
@@ -1325,8 +1329,8 @@ def get_color_histogram(img):
     cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
     return hist
 
-# [v21.4.4] Stability Release
-st.sidebar.caption("Version: v21.4.4-Final")
+# [v21.5] Cloud Stability Release
+st.sidebar.caption("Version: v21.5-CloudReady")
 
 # [v65 New] Callback to reset analysis state when tracking settings change
 def reset_analysis_state():
@@ -1373,7 +1377,7 @@ elif "Pro" in perf_mode:
     st.sidebar.caption("🎯 每 1 幀都分析 (最慢，捕捉最細微動作)")
 elif "MediaPipe" in perf_mode:
     frame_interval = 1
-    st.sidebar.caption("🔬 啟用 MediaPipe 擷取單一個案 540+ 關鍵點")
+    st.sidebar.caption("🔬 啟用 MediaPipe 擷取單一個人 540+ 關鍵點")
 else:
     frame_interval = 2
     st.sidebar.caption("⚡ 每 2 幀取樣 1 次 (預設，平衡速度與準確)")
@@ -1965,8 +1969,6 @@ if not st.session_state.analysis_done:
                                         p_shirt = get_clothing_pattern(shirt) # 新增圖案分析
 
                                         # [修正] 確保下裝特徵也被考慮
-                                        # 特徵計算改到這裡 (雖然有點重，但為了準確)
-                                        # 為了效能，可以只算前幾幀? 不，這裡已經是最後判定
                                         # 其實上衣跟下裝的邏輯是一樣的
                                         # 這裡只做簡單更新，避免覆蓋既有資訊? 不，我們每次都覆蓋最新的
 
@@ -2225,8 +2227,22 @@ if not st.session_state.analysis_done:
                                 st.session_state.video_output_path = converted_path
                             except Exception as e:
                                 logging.warning(f"FFmpeg conversion failed: {e}")
-                                # Fallback to original
-                                st.session_state.video_output_path = output_path
+                                # [v21.5 Fix] Robust Video Encoding for Cloud
+                                try:
+                                    # Use explicit full path for ffmpeg if possible, or just log results
+                                    st.info("🔄 正在進行 H.264 影像轉碼以相容網頁播放...")
+                                    temp_out_path = output_path
+                                    h264_out_path = converted_path
+                                    os.system(f'ffmpeg -y -i "{temp_out_path}" -c:v libx264 -preset ultrafast -crf 28 "{h264_out_path}"')
+                                    
+                                    if os.path.exists(h264_out_path) and os.path.getsize(h264_out_path) > 100:
+                                        st.session_state.video_output_path = h264_out_path
+                                    else:
+                                        st.warning("⚠️ H.264 轉碼失敗或檔案過小，將嘗試直接播放原始轉換軌。")
+                                        st.session_state.video_output_path = temp_out_path
+                                except Exception as e_ffmpeg_fallback:
+                                    st.error(f"❌ 影像轉碼發生錯誤: {e_ffmpeg_fallback}")
+                                    st.session_state.video_output_path = output_path
                         else:
                             logging.info("FFmpeg not found. Skipping conversion.")
                             st.session_state.video_output_path = output_path
