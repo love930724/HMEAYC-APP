@@ -1329,8 +1329,8 @@ def get_color_histogram(img):
     cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
     return hist
 
-# [v21.5.1] Hotfix Release
-st.sidebar.caption("Version: v21.5.1-Hotfix")
+# [v21.5.2] Stability Release
+st.sidebar.caption("Version: v21.5.2-FullRes")
 
 # [v65 New] Callback to reset analysis state when tracking settings change
 def reset_analysis_state():
@@ -2179,6 +2179,7 @@ if not st.session_state.analysis_done:
                             subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90)
                             if os.path.exists(converted_path) and os.path.getsize(converted_path) > 100:
                                 st.session_state.video_output_path = converted_path
+                                logging.info(f"FFmpeg Success: {converted_path}")
                             else:
                                 st.session_state.video_output_path = output_path
                         except Exception as e:
@@ -2186,16 +2187,16 @@ if not st.session_state.analysis_done:
                             st.session_state.video_output_path = output_path
                     else:
                         st.session_state.video_output_path = output_path
+                else:
+                    st.session_state.video_output_path = None
 
                 st_progress.empty() # 清除進度條
 
-                # [修正 2] 標記此檔案已處理完成 (使用 Session State 穩定值)
-                st.session_state.processed_file = st.session_state.current_fn
-                if out_video is not None:
-                    st.session_state.video_output_path = output_path 
-                else:
-                    if 'video_output_path' in st.session_state:
-                        del st.session_state.video_output_path
+                # [v21.5.2 Fix] Remove redundant path overwriting that happened in v21.5.1
+                # The video_output_path is already set by the FFmpeg block above.
+                if 'video_output_path' not in st.session_state or st.session_state.video_output_path is None:
+                    if out_video is not None:
+                         st.session_state.video_output_path = output_path
 
                 # [v66] 直接在此處完成所有數據結算，避免二次 Rerun 失敗
                 logging.info("Calculating Group Sync (Kuramoto)...")
