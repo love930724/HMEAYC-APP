@@ -345,72 +345,86 @@ if 'last_frame' not in st.session_state: st.session_state.last_frame = None
 if 'processed_file' not in st.session_state: st.session_state.processed_file = None
 # [v10] Color Hunt 專業色票庫 (HSV: H[0-180], S[0-255], V[0-255])
 REF_COLORS = {
-    "正紅": (0, 200, 200),
-    "暗紅/棗紅": (175, 160, 100), # [v38 Fix] Capture Dark Red/Maroon
-    "酒紅": (170, 200, 100),
-    "亮橘": (15, 200, 250),
-    "鵝黃": (30, 100, 240),
-    "土黃/芥末": (30, 200, 150),
-    "米色": (25, 30, 230), # [v38] Lower Hue slightly
-    "卡其": (35, 80, 180),
-    "深綠": (60, 200, 100),
-    "墨綠/軍綠": (55, 90, 60), # [v38 Fix] Lower V (80->60) to avoid confusion with dark red
-    "草綠": (50, 200, 200),
+    "正紅": (0, 220, 200),
+    "暗紅/棗紅": (175, 180, 80),
+    "酒紅": (170, 220, 80),
+    "亮橘": (15, 220, 250),
+    "鵝黃": (30, 150, 240),
+    "土黃/芥末": (25, 200, 150),
+    "米色": (20, 40, 230),
+    "卡其": (20, 80, 160), # [v68 Fix] Raise S (60->80) to avoid catching desaturated purple
+    "深綠": (60, 200, 80), # [v68 Fix] Lower V
+    "墨綠/軍綠": (65, 100, 40), # [v68 Fix] Distinct from Khaki
+    "草綠": (50, 220, 200),
     "湖水綠(Teal)": (85, 200, 150),
-    "淺藍": (100, 100, 240),
-    "牛仔藍": (110, 150, 200),
-    "深藍": (115, 200, 100),
-    "紫色": (140, 150, 200),
-    "淺紫": (135, 90, 220),       
-    "粉紅": (160, 100, 240),
-    "白/粉紅白": (165, 30, 240), # [v38] Handle pinkish white
+    "淺藍": (100, 120, 240),
+    "牛仔藍": (105, 100, 160),
+    "深藍": (115, 220, 80),
+    "紫色": (145, 110, 160), # [v68 Fix] Centered Purple (140->145, S:150->110)
+    "深紫": (150, 100, 80),  # [v68 New] Add Dark Purple
+    "淺紫": (135, 70, 220),       
+    "粉紅": (160, 120, 240),
+    "白/粉紅白": (165, 30, 240), 
     "桃紅/洋紅": (170, 180, 200), 
-    "白色": (0, 0, 250), # [v38] Higher V
-    "灰色": (0, 0, 128),
-    "黑色": (0, 0, 30),
-    "焦糖/棕色": (20, 150, 150)
+    "白色": (0, 0, 250), 
+    "灰色": (0, 0, 100), # [v68 Fix] Lower V
+    "黑色": (0, 0, 20),
+    "焦糖/棕色": (15, 160, 120)
 }
 
 def get_dominant_color(img):
     if img.size == 0: return "未知"
 
     # 轉為 HSV
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    try:
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    except:
+        return "未知"
+    
     h, s, v = cv2.split(hsv)
 
-    # [優化] 去除背景 (簡單用 V > 25 且 S > 10 當作前景)
-    valid_mask = (v > 25) 
-    if np.count_nonzero(valid_mask) < 10:
+    # [優化] 去除背景 (簡單用 V > 15 且 S > 5 當作有效區域)
+    # [v68 Fix] Lower thresholds to capture dark colors (Dark Green/Purple)
+    valid_mask = (v > 15) & (s > 5)
+    if np.count_nonzero(valid_mask) < 5:
         return "黑色" # 幾乎全黑
 
-    avg_h = np.mean(h[valid_mask])
-    avg_s = np.mean(s[valid_mask])
-    avg_v = np.mean(v[valid_mask])
+    # [v68 Upgrade] Use Median instead of Mean to resist skin-tone and shadow outliers
+    avg_h = np.median(h[valid_mask])
+    avg_s = np.median(s[valid_mask])
+    avg_v = np.median(v[valid_mask])
 
     current_color = (avg_h, avg_s, avg_v)
 
-    # [演算法] 尋找歐式距離最近的顏色
+    # [演算法] 尋找加權歐式距離最近的顏色
     min_dist = float('inf')
     best_match = "未知"
 
     for name, ref_hsv in REF_COLORS.items():
         # H 的距離要特別處理 (因為是環形，0 和 180 很近)
-        # 這裡簡化處理：如果 s 很低 (灰色/白色/米色)，H 的權重應該很低
-
-        # 權重調整: V (亮度) 對黑白灰很重要; H (色相) 對彩色很重要; S (飽和) 對米色/卡其中要
-        # 這裡使用加權歐式距離
         dh = min(abs(current_color[0] - ref_hsv[0]), 180 - abs(current_color[0] - ref_hsv[0]))
         ds = abs(current_color[1] - ref_hsv[1])
         dv = abs(current_color[2] - ref_hsv[2])
 
-        # 如果是低飽和度 (黑白灰米)，H 的權重要很小
+        # [v68 New] Dynamic Weighting System
         w_h, w_s, w_v = 1.0, 1.0, 1.0
-        if ref_hsv[1] < 50: # 低飽和參考色 (白/灰/米)
-            w_h = 0.1 # 色相不重要
-            w_s = 2.0 # 飽和度重要 (區分白vs米)
-            w_v = 2.0 # 亮度重要 (區分白vs灰vs黑)
-        else: # 彩色
-            w_h = 2.0 # 色相最重要
+        
+        # 1. 處理低飽和度 (黑白灰米)
+        if ref_hsv[1] < 50: 
+            w_h = 0.05 # 灰色系色相不重要
+            w_s = 2.0  # 飽和度區分白vs米
+            w_v = 3.0  # 亮度區分白vs灰vs黑
+        else:
+            # 2. 彩色系 (紫色、綠色等)
+            w_h = 3.5  # [v68 Fix] 強化色相權重，避免紫色偏移到卡其
+            w_s = 1.2
+            w_v = 1.0
+
+            # [v68 Fix] 對於特定問題色系 (紫色 120-160, 綠色 40-90) 加強鎖定
+            if 120 <= ref_hsv[0] <= 165 and 120 <= current_color[0] <= 165:
+                 w_h = 6.0 # 紫色加乘
+            if 40 <= ref_hsv[0] <= 90 and 40 <= current_color[0] <= 90:
+                 w_h = 5.0 # 綠色加乘
 
         dist = np.sqrt(w_h*(dh**2) + w_s*(ds**2) + w_v*(dv**2))
 
@@ -418,12 +432,11 @@ def get_dominant_color(img):
             min_dist = dist
             best_match = name
 
-    # [v8] 深淺前綴 (仍然保留，增加描述性)
+    # [v8] 深淺前綴
     prefix = ""
-    # 不對黑白灰加深淺
     if best_match not in ["白色", "黑色", "灰色", "米色"]:
-        if avg_v < 80: prefix = "深"
-        elif avg_v > 200: prefix = "淺/亮"
+        if avg_v < 60: prefix = "深"
+        elif avg_v > 220: prefix = "淺/亮"
 
     return f"{prefix}{best_match}"
 
@@ -2051,16 +2064,29 @@ if not st.session_state.analysis_done:
                                                     h = y2 - y1
                                                     if center_y < avg_y - (h * 0.20): 
                                                         current_actions.append("跳躍")
-                                                        color = (255, 255, 0) # Cyan
+                                                        color = (0, 255, 0) # Green (v21.5.8 Change)
 
-                                            # 5. Check Kick
+                                            # 5. Check Leg Up / Kick (抬腿/踢腿)
+                                            # Combined: Knee above Hip (LegUp) OR Ankle above Knee (Kick)
                                             if not is_lying_down and not "蹲下" in current_actions:
-                                                if kpts[15][2]>0.5 and kpts[13][2]>0.5:
-                                                    if kpts[15][1] < kpts[13][1]:
-                                                        current_actions.append("踢腿/抬腿")
-                                                elif kpts[16][2]>0.5 and kpts[14][2]>0.5:
-                                                    if kpts[16][1] < kpts[14][1]:
-                                                        current_actions.append("踢腿/抬腿")
+                                                leg_action_detected = False
+                                                # Left Leg
+                                                if kpts[13][2]>0.5: # Knee
+                                                    if kpts[11][2]>0.5 and kpts[13][1] < kpts[11][1] + 20: # Knee above Hip
+                                                        leg_action_detected = True
+                                                    elif kpts[15][2]>0.5 and kpts[15][1] < kpts[13][1]: # Ankle above Knee (Kick)
+                                                        leg_action_detected = True
+                                                
+                                                # Right Leg
+                                                if not leg_action_detected and kpts[14][2]>0.5:
+                                                    if kpts[12][2]>0.5 and kpts[14][1] < kpts[12][1] + 20: # Knee above Hip
+                                                        leg_action_detected = True
+                                                    elif kpts[16][2]>0.5 and kpts[16][1] < kpts[14][1]: # Ankle above Knee (Kick)
+                                                        leg_action_detected = True
+
+                                                if leg_action_detected:
+                                                    current_actions.append("抬腿")
+                                                    color = (19, 69, 139) # Brown (v21.5.9 Add)
 
                                             # 6. Check Running
                                             if not is_lying_down and mid in st.session_state.id_positions:
@@ -2080,7 +2106,7 @@ if not st.session_state.analysis_done:
                                             if current_actions:
                                                 action_map = {
                                                     "舉手": "HandsUp", "蹲下": "Squat", "跳躍": "Jump",
-                                                    "地板動作": "Floor", "踢腿/抬腿": "Kick", "跑步": "Run"
+                                                    "地板動作": "Floor", "抬腿": "LegUp/Kick", "跑步": "Run"
                                                 }
                                                 english_tags = [action_map.get(a, a) for a in current_actions]
                                                 display_action_en = "+".join(english_tags)
@@ -2189,11 +2215,19 @@ if not st.session_state.analysis_done:
                     
                     import shutil
                     import subprocess
-                    if shutil.which("ffmpeg"):
+                    
+                    # [v67 Fix] Robust FFmpeg Detection with absolute path fallback
+                    ffmpeg_exe = shutil.which("ffmpeg")
+                    if not ffmpeg_exe:
+                        fallback_path = r"C:\Users\user\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.0.1-full_build\bin\ffmpeg.exe"
+                        if os.path.exists(fallback_path):
+                            ffmpeg_exe = fallback_path
+                            
+                    if ffmpeg_exe:
                         try:
                             # Use ultrafast and crf 28 for cloud performance
                             cmd = [
-                                "ffmpeg", "-y", "-i", output_path,
+                                ffmpeg_exe, "-y", "-i", output_path,
                                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
                                 "-f", "mp4", converted_path
                             ]
