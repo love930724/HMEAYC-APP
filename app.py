@@ -1654,12 +1654,30 @@ if not st.session_state.analysis_done:
                 mp_drawing_styles = None
                 holistic_model = None
                 if use_mp:
-                    mp_holistic = mp.solutions.holistic
-                    mp_drawing = mp.solutions.drawing_utils
-                    mp_drawing_styles = mp.solutions.drawing_styles
                     try:
-                        holistic_model = mp_holistic.Holistic(
-                            static_image_mode=False,
+                        import mediapipe.python.solutions.holistic as mp_solutions_holistic
+                        import mediapipe.python.solutions.drawing_utils as mp_drawing_utils
+                        import mediapipe.python.solutions.drawing_styles as mp_drawing_styles_module
+                        
+                        mp_holistic = mp_solutions_holistic
+                        mp_drawing = mp_drawing_utils
+                        mp_drawing_styles = mp_drawing_styles_module
+                    except ImportError:
+                        try:
+                            import mediapipe.solutions.holistic as mp_solutions_holistic
+                            import mediapipe.solutions.drawing_utils as mp_drawing_utils
+                            import mediapipe.solutions.drawing_styles as mp_drawing_styles_module
+                            
+                            mp_holistic = mp_solutions_holistic
+                            mp_drawing = mp_drawing_utils
+                            mp_drawing_styles = mp_drawing_styles_module
+                        except ImportError as e:
+                            st.error(f"MediaPipe Submodule Import Error: {e}")
+                    
+                    if mp_holistic:
+                        try:
+                            holistic_model = mp_holistic.Holistic(
+                                static_image_mode=False,
                             model_complexity=1, 
                             enable_segmentation=False,
                             refine_face_landmarks=True, 
