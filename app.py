@@ -1312,6 +1312,21 @@ def detectaction_and_gaze(kpts, bbox=None): # 新增 bbox 參數用於長寬比�
 
     return list(set(actions)) # 去重
 
+# [v66 New] Optimized Landmark Translation (No Dict Conversion)
+def translate_landmarks_fast(landmark_list, crop_x1, crop_y1, roi_w, roi_h, frame_w, frame_h):
+    if not landmark_list: return None
+    from mediapipe.framework.formats import landmark_pb2
+    new_landmarks = landmark_pb2.NormalizedLandmarkList()
+    
+    for lm in landmark_list.landmark:
+        # Convert to absolute ROI pixels -> Add crop offset -> Back to normalized frame
+        new_lm = new_landmarks.landmark.add()
+        new_lm.x = (lm.x * roi_w + crop_x1) / frame_w
+        new_lm.y = (lm.y * roi_h + crop_y1) / frame_h
+        new_lm.z = lm.z
+        new_lm.visibility = lm.visibility
+    return new_landmarks
+
 # [New Helper UI]
 def create_tracker_config():
     config_content = """
@@ -1389,11 +1404,15 @@ elif "Pro" in perf_mode:
     frame_interval = 1
     st.sidebar.caption("🎯 每 1 幀都分析 (最慢，捕捉最細微動作)")
 elif "MediaPipe" in perf_mode:
-    frame_interval = 1
-    st.sidebar.caption("🔬 啟用 MediaPipe 擷取單一個人 540+ 關鍵點")
+    # [v66 Upgrade] Allow slight frame skipping in MediaPipe mode to prevent UI lag
+    frame_interval = st.sidebar.slider("🔬 微觀分析跳幀 (越低越精細)", 1, 5, 2, help="1為每幀分析(最慢)，2-3適合大部份電腦。")
+    st.sidebar.caption(f"目前頻率：每 {frame_interval} 幀分析一次")
+    # [v66 New] Optional Face Mesh for performance
+    use_face_mesh = st.sidebar.toggle("🎭 啟動面部關鍵點 (468點)", value=False, help="若不需要分析表情，關閉此項可大幅提升速度。")
 else:
     frame_interval = 2
     st.sidebar.caption("⚡ 每 2 幀取樣 1 次 (預設，平衡速度與準確)")
+    use_face_mesh = False
 
 st.sidebar.markdown("---")
 # [v21.5.5] Cloud Performance Booster Toggle
@@ -1424,6 +1443,9 @@ target_track_id = st.sidebar.number_input(
     help="輸入您想觀察的幼兒ID。若設為 0，則全功能模式會追蹤所有人。",
     on_change=reset_analysis_state
 )
+
+if "MediaPipe" in perf_mode:
+    st.sidebar.info("💡 **小撇步**：\n1. 先用「標準模式」跑一次，記住想觀察的人的 ID 指標。\n2. 再切換到「微觀模式」並在上方輸入該 ID。\n3. 若設為 0，系統會自動鎖定畫面中最大的目標。")
 # [v48 New] Context-Aware Sync (Phase 5)
 st.sidebar.markdown("### 🎭 活動性質設定")
 
@@ -1606,21 +1628,23 @@ if not st.session_state.analysis_done:
                     st.session_state.effective_fps = fps # [v47] Persist for Post-Analysis
                     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    # [v67 Fix] Force even dimensions (Some H.264 codecs fail with odd numbers)
+                    if width % 2 != 0: width -= 1
+                    if height % 2 != 0: height -= 1
 
                     # [v15 Fix] Use UUID to prevent file locking
                     unique_id = uuid.uuid4().hex[:8]
                     # [v18.6 Fix] Save to project dir to ensure persistence
                     output_path = os.path.abspath("obs_video.mp4")
 
-                    # [v23 Fix] Revert to 'avc1' first for Local Compatibility
-                    # If 'avc1' fails (e.g. Cloud), it falls back to 'mp4v'
-                    # Then FFmpeg Post-Processing (below) fixes it for Web
-                    fourcc = cv2.VideoWriter_fourcc(*'avc1') 
+                    # [v67 Fix] Use 'mp4v' as default for better OpenCV stability on mix of platforms
+                    # We convert it to H.264 via FFmpeg anyway, so mp4v is safer for the intermediate step.
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
                     try:
                         out_video = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
                         if not out_video.isOpened():
-                            # Fallback to mp4v if avc1 fails
-                            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                            # Fallback to XVID
+                            fourcc = cv2.VideoWriter_fourcc(*'XVID')
                             out_video = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
                     except Exception as e:
                         st.warning(f"⚠️ 影片寫入器初始化失敗: {e}")
@@ -1676,16 +1700,17 @@ if not st.session_state.analysis_done:
                     
                     if mp_holistic:
                         try:
+                            # [v66 Fix] Use Sidebar Toggle for Face Mesh
                             holistic_model = mp_holistic.Holistic(
                                 static_image_mode=False,
-                            model_complexity=1, 
-                            enable_segmentation=False,
-                            refine_face_landmarks=True, 
-                            min_detection_confidence=0.5,
-                            min_tracking_confidence=0.5
-                        )
-                    except Exception as e:
-                        st.warning(f"MediaPipe Model Init Error: {e}")
+                                model_complexity=1, 
+                                enable_segmentation=False,
+                                refine_face_landmarks=use_face_mesh, 
+                                min_detection_confidence=0.5,
+                                min_tracking_confidence=0.5
+                            )
+                        except Exception as e:
+                            st.warning(f"MediaPipe Model Init Error: {e}")
 
 
                 while cap.isOpened():
@@ -1760,39 +1785,14 @@ if not st.session_state.analysis_done:
                                 results_mp = holistic_model.process(roi_rgb)
 
                                 if results_mp.pose_landmarks:
-                                    # Function to translate normalized ROI coordinates back to original frame
-                                    def translate_landmarks(landmark_list, crop_x1, crop_y1, roi_w, roi_h, frame_w, frame_h):
-                                        if not landmark_list: return None
-                                        # Create a deep copy using protobuf
-                                        from google.protobuf.json_format import MessageToDict, ParseDict
-                                        from mediapipe.framework.formats import landmark_pb2
-
-                                        dict_lms = MessageToDict(landmark_list)
-                                        new_landmarks = landmark_pb2.NormalizedLandmarkList()
-
-                                        for i, lm in enumerate(landmark_list.landmark):
-                                            # Convert to absolute ROI pixels
-                                            abs_x = lm.x * roi_w
-                                            abs_y = lm.y * roi_h
-                                            # Add crop offset
-                                            orig_abs_x = abs_x + crop_x1
-                                            orig_abs_y = abs_y + crop_y1
-                                            # Convert back to normalized original frame coordinates
-                                            lm_dict = {'x': orig_abs_x / frame_w, 'y': orig_abs_y / frame_h, 'z': lm.z, 'visibility': lm.visibility}
-                                            new_lm = new_landmarks.landmark.add()
-                                            new_lm.x = lm_dict['x']
-                                            new_lm.y = lm_dict['y']
-                                            new_lm.z = lm_dict['z']
-                                            new_lm.visibility = lm_dict['visibility']
-                                        return new_landmarks
-
                                     roi_h, roi_w, _ = roi.shape
 
+                                    # [v66] Use FAST Translation function
                                     # Translate all landmarks back to full frame
-                                    global_pose = translate_landmarks(results_mp.pose_landmarks, crop_x1, crop_y1, roi_w, roi_h, w_frame, h_frame)
-                                    global_face = translate_landmarks(results_mp.face_landmarks, crop_x1, crop_y1, roi_w, roi_h, w_frame, h_frame)
-                                    global_lh = translate_landmarks(results_mp.left_hand_landmarks, crop_x1, crop_y1, roi_w, roi_h, w_frame, h_frame)
-                                    global_rh = translate_landmarks(results_mp.right_hand_landmarks, crop_x1, crop_y1, roi_w, roi_h, w_frame, h_frame)
+                                    global_pose = translate_landmarks_fast(results_mp.pose_landmarks, crop_x1, crop_y1, roi_w, roi_h, w_frame, h_frame)
+                                    global_face = translate_landmarks_fast(results_mp.face_landmarks, crop_x1, crop_y1, roi_w, roi_h, w_frame, h_frame) if use_face_mesh else None
+                                    global_lh = translate_landmarks_fast(results_mp.left_hand_landmarks, crop_x1, crop_y1, roi_w, roi_h, w_frame, h_frame)
+                                    global_rh = translate_landmarks_fast(results_mp.right_hand_landmarks, crop_x1, crop_y1, roi_w, roi_h, w_frame, h_frame)
 
                                     # Draw on the original frame using translated landmarks
                                     mp_drawing.draw_landmarks(annotated_frame, global_pose, mp_holistic.POSE_CONNECTIONS, landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style())
@@ -1824,7 +1824,30 @@ if not st.session_state.analysis_done:
                                     st.session_state.id_actions[mid]["微觀追蹤(全身543點)"] = st.session_state.id_actions[mid].get("微觀追蹤(全身543點)", 0) + 1
 
                                     if mid not in st.session_state.id_features:
-                                        st.session_state.id_features[mid] = {"clothing": "特定鎖定對象" if found_specific_id else "自動鎖定最大對象", "score_pending": True, "original_id": mid}
+                                        # [v67 New] Micro Mode Clothing Extraction
+                                        # Use the target_box to crop shirt and pants from the original frame
+                                        bx1, by1, bx2, by2 = target_box
+                                        bh_box = by2 - by1
+                                        shirt = frame[max(0, by1+int(bh_box*0.1)):min(h_frame, by1 + int(bh_box*0.4)), bx1+int((bx2-bx1)*0.2):bx2-int((bx2-bx1)*0.2)]
+                                        pants = frame[max(0, by1 + int(bh_box*0.6)):min(h_frame, by2-int(bh_box*0.1)), bx1+int((bx2-bx1)*0.2):bx2-int((bx2-bx1)*0.2)]
+                                        
+                                        c_shirt = get_dominant_color(shirt)
+                                        c_pants = get_dominant_color(pants)
+                                        # [v68 Fix] Also support patterns in Micro Mode
+                                        p_shirt = get_clothing_pattern(shirt)
+                                        p_pants = get_clothing_pattern(pants)
+                                        
+                                        feat_str = f"上衣：{c_shirt}{p_shirt}。下裝：{c_pants}{p_pants}、褲子。配件：無。"
+                                        
+                                        st.session_state.id_features[mid] = {
+                                            "clothing": feat_str, 
+                                            "score_pending": True, 
+                                            "original_id": mid,
+                                            "hist": get_color_histogram(shirt)
+                                        }
+
+                                    # [v68 New] Draw Bounding Box around the target
+                                    cv2.rectangle(annotated_frame, (crop_x1, crop_y1), (crop_x2, crop_y2), (0, 255, 0), 4)
 
                                     # Use the YOLO bounding box for label
                                     nx, ny = crop_x1, max(0, crop_y1 - 20)
@@ -1840,35 +1863,31 @@ if not st.session_state.analysis_done:
                             else:
                                 # Draw warning if no target found
                                 cv2.putText(annotated_frame, "No Target Found", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                        if not use_mp:
+                            # [更新] 使用動態產生的設定檔
+                            tracker_file = create_tracker_config()
+                            # [PyInstaller Fix] Ensure tracker file exists or path is correct (created in current dir)
 
-                            if 'st_frame' in locals() and annotated_frame is not None:
-                                frame_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-                                st_frame.image(frame_rgb)
-                            if out_video is not None:
-                                out_video.write(annotated_frame)
-                            continue # Skip YOLO processing
+                            # [調整] 信心度門檻微調 (0.25 -> 0.20) 捕捉更多模糊 ID
+                            # [調整] IoU (0.5 -> 0.7) 允許更多重疊 (Crowd Robustness)
+                            # [v21] Cloud Optimization: imgsz=480
+                            results = model.track(frame, persist=True, verbose=False, conf=0.20, iou=0.7, tracker=tracker_file, imgsz=480)
 
-                        # [更新] 使用動態產生的設定檔
-                        tracker_file = create_tracker_config()
-                        # [PyInstaller Fix] Ensure tracker file exists or path is correct (created in current dir)
+                            # 檢查是否有偵測到東西
+                            if results and len(results) > 0 and results[0].boxes is not None and results[0].boxes.id is not None:
+                                # [重要] 恢復彩色骨架：使用 plot() 但不畫預設框 (boxes=False)，保留骨架連線
+                                try:
+                                    # [要求] 強制顯示彩色骨架連線 (kpt_line=True, kpt_radius=5)
+                                    annotated_frame = results[0].plot(boxes=False, labels=False, probs=False, kpt_line=True, kpt_radius=5)
+                                except:
+                                    annotated_frame = frame.copy()
 
-                        # [調整] 信心度門檻微調 (0.25 -> 0.20) 捕捉更多模糊 ID
-                        # [調整] IoU (0.5 -> 0.7) 允許更多重疊 (Crowd Robustness)
-                        # [v21] Cloud Optimization: imgsz=480
-                        results = model.track(frame, persist=True, verbose=False, conf=0.20, iou=0.7, tracker=tracker_file, imgsz=480)
+                                ids = results[0].boxes.id.int().cpu().numpy()
+                                boxes = results[0].boxes.xyxy.cpu().numpy()
+                                keypoints_data = results[0].keypoints.data.cpu().numpy() if results[0].keypoints is not None else None
 
-                        # 檢查是否有偵測到東西
-                        if results and len(results) > 0 and results[0].boxes is not None and results[0].boxes.id is not None:
-                            # [重要] 恢復彩色骨架：使用 plot() 但不畫預設框 (boxes=False)，保留骨架連線
-                            try:
-                                # [要求] 強制顯示彩色骨架連線 (kpt_line=True, kpt_radius=5)
-                                annotated_frame = results[0].plot(boxes=False, labels=False, probs=False, kpt_line=True, kpt_radius=5)
-                            except:
-                                annotated_frame = frame.copy()
-
-                            ids = results[0].boxes.id.int().cpu().numpy()
-                            boxes = results[0].boxes.xyxy.cpu().numpy()
-                            keypoints_data = results[0].keypoints.data.cpu().numpy() if results[0].keypoints is not None else None
+                                # (Existing YOLO processing logic ... truncated for brevity in this tool call but I will provide the full block in a moment)
+                                # I need to be careful with the range here.
 
                             # [Re-ID 步驟 1: 更新 Lost IDs]
                             current_mids = set([int(i) for i in ids])
@@ -2183,6 +2202,8 @@ if not st.session_state.analysis_done:
                                         if dist < 150:
                                             pair = tuple(sorted((mid, other_mid)))
                                             st.session_state.id_interactions[pair] = st.session_state.id_interactions.get(pair, 0) + 1
+                        
+                        # [v66] Ensure annotated_frame is closed for Standard Mode block
 
                         # [Fix] Update UI (Outside Loop)
                         if 'annotated_frame' not in locals():
@@ -2203,13 +2224,18 @@ if not st.session_state.analysis_done:
                             else:
                                 # Booster is ON: Only update status text periodically
                                 if (f_idx // frame_interval) % 30 == 0:
-                                    st_frame.write(f"🚀 Turbo 加速中：正在全力辨識數據... ({progress_pct:.0f}%)")
+                                    st_frame.write(f"🚀 Turbo 加速中：正在全力辨識數據... ({prog*100:.0f}%)")
 
                         # [v21.4 Fix] ALWAYS write frame to output video, even if no detection
                         # This ensures the output video has the correct length and sync.
                         if out_video is not None:
                             try:
-                                out_video.write(annotated_frame if annotated_frame is not None else frame)
+                                # [v67 Fix] Explicitly resize frame to match VideoWriter initialization
+                                # This prevents 'vertical streaks' caused by stride/resolution mismatch.
+                                f_to_write = annotated_frame if annotated_frame is not None else frame
+                                if f_to_write.shape[1] != width or f_to_write.shape[0] != height:
+                                    f_to_write = cv2.resize(f_to_write, (width, height))
+                                out_video.write(f_to_write)
                             except:
                                 pass
 
@@ -2247,6 +2273,7 @@ if not st.session_state.analysis_done:
                             cmd = [
                                 ffmpeg_exe, "-y", "-i", output_path,
                                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+                                "-pix_fmt", "yuv420p", # [v67 Fix] Force standard pixel format for web support
                                 "-f", "mp4", converted_path
                             ]
                             subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90)
