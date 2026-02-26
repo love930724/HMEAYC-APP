@@ -574,8 +574,18 @@ def draw_social_graph(interactions, id_map, width=1100, height=1000, min_sec=3.0
     # Create white canvas
     canvas = np.ones((height, width, 3), dtype=np.uint8) * 255
 
-    # Determine nodes (unique IDs)
-    nodes = list(id_map.keys())
+    # [v76 Robust Fix] Determine nodes (unique IDs) from both map and interactions
+    # Ensure all IDs are treated as integers to prevent type mismatch
+    node_set = set()
+    for k in id_map.keys():
+        try: node_set.add(int(k))
+        except: pass
+    for pair in interactions.keys():
+        for p in pair:
+            try: node_set.add(int(p))
+            except: pass
+    
+    nodes = sorted(list(node_set))
     if not nodes: return canvas
 
     # Position nodes in a circle
@@ -584,8 +594,13 @@ def draw_social_graph(interactions, id_map, width=1100, height=1000, min_sec=3.0
     radius = 400 
     node_positions = {}
 
+    # [v77 Fix] Dynamic Node Radius based on population (prevents overlap hiding lines)
+    num_nodes = len(nodes)
+    # circumference / (nodes * constant)
+    node_radius = max(10, min(30, int(2512 / (num_nodes * 2.5))))
+
     for i, node_id in enumerate(nodes):
-        angle = 2 * np.pi * i / len(nodes)
+        angle = 2 * np.pi * i / num_nodes
         x = int(cx + radius * np.cos(angle))
         y = int(cy + radius * np.sin(angle))
         node_positions[node_id] = (x, y)
@@ -602,50 +617,49 @@ def draw_social_graph(interactions, id_map, width=1100, height=1000, min_sec=3.0
     
     needed_count = (min_sec * 30.0) / f_int
 
-    for (id1, id2), count in interactions.items():
+    for pair, count in interactions.items():
         if count < needed_count: continue 
 
-        pt1 = node_positions.get(id1)
-        pt2 = node_positions.get(id2)
+        # Normalize pair IDs for lookup
+        try:
+            p1, p2 = int(pair[0]), int(pair[1])
+        except:
+            continue
+
+        pt1 = node_positions.get(p1)
+        pt2 = node_positions.get(p2)
 
         if pt1 and pt2:
-            # Thickness based on frequency (1 to 8)
-            thickness = max(1, int((count / max_count) * 8)) 
-
-            # Color: Darker Gray for better contrast (100,100,100)
-            cv2.line(canvas, pt1, pt2, (150, 150, 150), thickness)
+            # [v77] Slightly thicker and darker lines for better visibility
+            thickness = max(1, int((count / max_count) * 10)) 
+            # Color: Darker Gray (100,100,100) for better contrast
+            cv2.line(canvas, pt1, pt2, (100, 100, 100), thickness)
 
     # Draw nodes
-    for node_id, (x, y) in node_positions.items():
+    for node_id in nodes:
+        pos = node_positions.get(node_id)
+        if not pos: continue
+        x, y = pos
+
         color = (235, 206, 135) # SkyBlue (BGR)
         # Highlight "Core" nodes (high degree)
-        degree = sum([c for (k, c) in interactions.items() if node_id in k])
-        if degree > max_count * 0.4: color = (0, 0, 255) # Red (BGR) [v33] Lowered active threshold
+        degree = sum([c for (k, c) in interactions.items() if node_id in [int(x) for x in k]])
+        if degree > max_count * 0.4: color = (0, 0, 255) # Red (BGR)
 
-        # [v20.12 Refine] Node Radius 30 (User Request: "dots bigger")
-        cv2.circle(canvas, (x, y), 30, color, -1) 
-        cv2.circle(canvas, (x, y), 30, (0, 0, 0), 2)
+        # [v77] Use dynamic radius
+        cv2.circle(canvas, (x, y), node_radius, color, -1) 
+        cv2.circle(canvas, (x, y), node_radius, (0, 0, 0), 1 if node_radius < 15 else 2)
 
-        # Show ID
-        # [v31] Support Custom Name if available?
-        # Canvas drawing logic is separate from DF. 
-        # But we can try to look up from session state if simple enough.
-        # For graph clarity, maybe keep ID number? Or use Name if short.
+        # [v76 Robust] Try to get label from id_map or use ID
         label = str(node_id)
-        if "Teacher" in id_map.get(node_id, ""): label = "T"
+        # Check if the map has this key (might be str or int)
+        map_val = id_map.get(node_id) or id_map.get(str(node_id), "")
+        if "Teacher" in map_val: label = "T"
 
-        # Try to use Custom Name if defined in session state
-        # (This is a nice-to-have, but graph might get crowded)
-        # Let's check session state
-        real_label = label
-        # We don't have direct access to session_state here comfortably without import issues?
-        # Actually we do, inside the function.
-        # But `id_map` passed in is usually just {id: id_string}.
-
-        # [v20.12 Refine] Larger font for larger nodes (0.4 -> 0.8)
-        font_scale = 0.8
-        ts = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 2)[0]
-        cv2.putText(canvas, label, (x - ts[0]//2, y + ts[1]//2), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 2)
+        # [v77] Scale font based on radius
+        font_scale = 0.4 if node_radius < 20 else 0.8
+        ts = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1 if node_radius < 20 else 2)[0]
+        cv2.putText(canvas, label, (x - ts[0]//2, y + ts[1]//2), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1 if node_radius < 20 else 2)
 
     return canvas
 
