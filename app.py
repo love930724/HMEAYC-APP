@@ -25,7 +25,7 @@ DB_FILE = "hmeayc.db"
 
 def init_db():
     """Initialize SQLite database with required tables."""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=20)
     c = conn.cursor()
 
     # 1. Observations Table (Master)
@@ -80,6 +80,16 @@ def init_db():
         except Exception as e:
             print(f"Migration Error (stability_score): {e}")
 
+    # [v73 Fix] Auto-migration check (Add is_deleted to records if missing)
+    try:
+        c.execute("SELECT is_deleted FROM records LIMIT 1")
+    except sqlite3.OperationalError:
+        try:
+            c.execute("ALTER TABLE records ADD COLUMN is_deleted INTEGER DEFAULT 0")
+            conn.commit()
+        except Exception as e:
+            print(f"Migration Error (records is_deleted): {e}")
+
     conn.close()
 
 def save_analysis_to_db(observer, activity, video, df):
@@ -87,7 +97,7 @@ def save_analysis_to_db(observer, activity, video, df):
     if df.empty: return False
 
     try:
-        conn = sqlite3.connect(DB_FILE) # Fix: Use string or variable consistently
+        conn = sqlite3.connect(DB_FILE, timeout=20) # v70 Fix: Add timeout for multi-user writes
         c = conn.cursor()
 
         # [v32 Fix] Check if we already have a session ID for this analysis
@@ -167,7 +177,7 @@ def save_analysis_to_db(observer, activity, video, df):
 def restore_observation_record(obs_id):
     """Restore a soft-deleted record."""
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(DB_FILE, timeout=20)
         c = conn.cursor()
         c.execute("UPDATE observations SET is_deleted=0 WHERE id=?", (obs_id,))
         conn.commit()
@@ -181,16 +191,29 @@ def restore_observation_record(obs_id):
 # [v41 New] History Management Helpers
 # [v41 New] History Management Helpers
 def delete_student_record(obs_id, student_id):
-    """Delete a specific student record from an observation."""
+    """Soft-delete a specific student record from an observation."""
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(DB_FILE, timeout=20)
         c = conn.cursor()
-        c.execute("DELETE FROM records WHERE obs_id=? AND student_id=?", (obs_id, student_id))
+        c.execute("UPDATE records SET is_deleted=1 WHERE obs_id=? AND student_id=?", (obs_id, student_id))
         conn.commit()
         conn.close()
         return True
     except Exception as e:
         logging.error(f"Delete Student Error: {e}")
+        return False
+
+def restore_student_record(obs_id, student_id):
+    """Restore a soft-deleted student record."""
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=20)
+        c = conn.cursor()
+        c.execute("UPDATE records SET is_deleted=0 WHERE obs_id=? AND student_id=?", (obs_id, student_id))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logging.error(f"Restore Student Error: {e}")
         return False
 
 # [v48 New] Motion Smoothness (Neuro-Motor Analysis)
@@ -223,7 +246,7 @@ def calculate_smoothness(pos_history):
 def rename_student_record(obs_id, old_name, new_name):
     """Rename a specific student in an observation record."""
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(DB_FILE, timeout=20)
         c = conn.cursor()
         c.execute("UPDATE records SET student_id=? WHERE obs_id=? AND student_id=?", (new_name, obs_id, old_name))
         conn.commit()
@@ -240,7 +263,7 @@ def merge_student_identity(source_name, target_name):
     Returns (success, count_updated).
     """
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(DB_FILE, timeout=20)
         c = conn.cursor()
 
         # Check if source exists
@@ -324,7 +347,7 @@ except:
 st.set_page_config(page_title="HMEAYC 專業觀察系統", layout="wide")
 st.title("🩰 解碼教室裡的舞蹈：AI 智能助教系統")
 st.caption("最終決賽版：數據同步與視覺強化鎖定模式")
-# @st.cache_resource # [重要] 暫時移除快取以清除潛在錯誤狀態
+@st.cache_resource # [v70 Fix] Crucial for Multi-user: Share model across sessions to save RAM
 def load_model():
     # 增加錯誤處理
     try:
@@ -339,6 +362,8 @@ model = load_model()
 # 初始化保險箱 (Session State)
 if 'id_list' not in st.session_state: st.session_state.id_list = set()
 if 'id_features' not in st.session_state: st.session_state.id_features = {}
+# [v70 New] Persistent Unique ID per browser session for safe file handling
+if 'session_id' not in st.session_state: st.session_state.session_id = uuid.uuid4().hex[:8]
 if 'analysis_done' not in st.session_state: st.session_state.analysis_done = False
 if 'last_frame' not in st.session_state: st.session_state.last_frame = None
 # 新增：追蹤目前處理完畢的檔案名稱，避免重複跑
@@ -528,22 +553,23 @@ def check_gaze_at_target(observer_pos, observer_yaw, target_pos, tolerance=20):
     # If Target is Right (dx > 0), Observer must look Right (Yaw > threshold)
     # If Target is Left (dx < 0), Observer must look Left (Yaw < -threshold)
 
-    threshold = 10 # Min degrees to be considered "Looking Side"
+    threshold = 10 # [v72] Min degrees to be considered "Looking Side"
 
-    if dx > 50: # Target is significantly to the Right
+    if dx > 50: # [v72] Target is significantly to the Side
         return observer_yaw > threshold 
-    elif dx < -50: # Target is significantly to the Left
+    elif dx < -50: 
         return observer_yaw < -threshold
 
     # Target is straight ahead (approx same X)
     # Observer should be looking Center
     return abs(observer_yaw) < threshold
 
-def draw_social_graph(interactions, id_map, width=1100, height=1000):
+def draw_social_graph(interactions, id_map, width=1100, height=1000, min_sec=3.0):
     """
     Draw a social network graph using OpenCV.
     interactions: dict {(id1, id2): count}
     id_map: dict {id: label}
+    min_sec: Minimum duration in seconds to show a connection
     """
     # Create white canvas
     canvas = np.ones((height, width, 3), dtype=np.uint8) * 255
@@ -567,11 +593,17 @@ def draw_social_graph(interactions, id_map, width=1100, height=1000):
     # Draw edges
     max_count = max(interactions.values()) if interactions else 1
 
-    # [v33 Update] Lower threshold to show more connections
-    # [v33 Update] Darker lines for visibility
+    # [v74 Fix] Dynamic threshold based on user slider
+    f_int = 2 # Assume default
+    try:
+        import streamlit as st
+        f_int = st.session_state.get('last_frame_interval', 2)
+    except: pass
+    
+    needed_count = (min_sec * 30.0) / f_int
 
     for (id1, id2), count in interactions.items():
-        if count < 2: continue # [v33] Lowered threshold from 3 to 2
+        if count < needed_count: continue 
 
         pt1 = node_positions.get(id1)
         pt2 = node_positions.get(id2)
@@ -1056,8 +1088,7 @@ def show_history_ui():
                 obs_id = int(obs_to_delete.split(" | ")[0])
                 if st.button(f"確認刪除紀錄 ({obs_id})", type="primary", key="btn_del_obs"):
                     if delete_observation_record(obs_id):
-                        st.success("紀錄已刪除！請重新整理頁面。")
-                        st.session_state.clear()
+                        st.success("紀錄已刪除！")
                         st.rerun()
                     else:
                         st.error("刪除失敗。")
@@ -1076,9 +1107,9 @@ def show_history_ui():
             if target_obs_str:
                 target_obs_id = int(target_obs_str.split(" | ")[0])
 
-                # 2. Get Students in this observation
+                # 2. Get Students in this observation (Filter deleted)
                 conn = sqlite3.connect("hmeayc.db")
-                stu_df = pd.read_sql_query("SELECT DISTINCT student_id FROM records WHERE obs_id=?", conn, params=(target_obs_id,))
+                stu_df = pd.read_sql_query("SELECT DISTINCT student_id FROM records WHERE obs_id=? AND is_deleted=0", conn, params=(target_obs_id,))
                 conn.close()
 
                 target_student = st.selectbox("2. 選擇幼兒:", 
@@ -1137,12 +1168,48 @@ def show_history_ui():
                         else:
                             st.error("復原失敗")
 
+            st.markdown("---")
+            st.subheader("🗑️ 已刪除的幼兒紀錄 (單一幼兒)")
+            conn = sqlite3.connect(DB_FILE)
+            # Find students that are deleted in observations that are NOT deleted
+            df_del_stu = pd.read_sql_query("""
+                SELECT r.obs_id, r.student_id, o.obs_date, o.activity_name 
+                FROM records r
+                JOIN observations o ON r.obs_id = o.id
+                WHERE r.is_deleted = 1 AND o.is_deleted = 0
+                ORDER BY o.timestamp DESC
+            """, conn)
+            conn.close()
+
+            if not df_del_stu.empty:
+                st.caption(f"ℹ️ 目前垃圾桶中有 {len(df_del_stu)} 筆幼兒紀錄待復原。")
+
+            if df_del_stu.empty:
+                st.info("目前無被刪除的單一幼兒紀錄。")
+            else:
+                stu_to_restore = st.selectbox("選擇要復原的幼兒:", 
+                                        df_del_stu['obs_id'].astype(str) + " | " + df_del_stu['student_id'] + " | " + df_del_stu['obs_date'] + " | " + df_del_stu['activity_name'],
+                                        index=None,
+                                        placeholder="選擇要復原的幼兒...",
+                                        key="restore_stu_select"
+                )
+                if stu_to_restore:
+                    parts = stu_to_restore.split(" | ")
+                    s_obs_id = int(parts[0])
+                    s_name = parts[1]
+                    if st.button(f"確認復原幼兒 ({s_name})", key="btn_restore_stu"):
+                        if restore_student_record(s_obs_id, s_name):
+                            st.success(f"已成功復原幼兒 {s_name}！")
+                            st.rerun()
+                        else:
+                            st.error("復原失敗")
+
         with m_tab4: # [v47 New] Identity Merge Tab
             st.caption("👥 將多個暫存 ID (如 ID_1) 合併到同一位學生 (如 小明) 名下。此操作無法復原。")
 
-            # Get distinct student IDs
+            # Get distinct student IDs (Filter deleted)
             conn = sqlite3.connect(DB_FILE)
-            temp_df = pd.read_sql_query("SELECT DISTINCT student_id FROM records ORDER BY student_id", conn)
+            temp_df = pd.read_sql_query("SELECT DISTINCT student_id FROM records WHERE is_deleted=0 ORDER BY student_id", conn)
             conn.close()
 
             all_ids = temp_df['student_id'].tolist() if not temp_df.empty else []
@@ -1176,25 +1243,26 @@ def show_history_ui():
     st.markdown("---")
     st.subheader("📈 幼兒個人成長歷程")
 
-    # Get unique student IDs from all records
+    # Get unique student IDs from all active records
     conn = sqlite3.connect(DB_FILE)
-    all_students = pd.read_sql_query("SELECT DISTINCT student_id FROM records ORDER BY student_id", conn)
+    all_students = pd.read_sql_query("SELECT DISTINCT student_id FROM records WHERE is_deleted=0 ORDER BY student_id", conn)
     conn.close()
 
+    # [v71 Fix] Enhanced Numerical Sorting for History Dropdown
     student_list = all_students['student_id'].tolist()
+    
+    def try_sort_key(x):
+        # Extract numerical part of "ID_X" or similar strings for natural sorting
+        import re
+        nums = re.findall(r'\d+', str(x))
+        return int(nums[0]) if nums else 999
 
-    # Helper to sort IDs numerically if possible
-    def try_sort(x):
-        try:
-            if "ID_" in x and "(" in x: # Format: ID_1 (Original)
-                return int(x.split("_")[1].split(" ")[0])
-            return x
-        except:
-            return x
+    try:
+        student_list.sort(key=try_sort_key)
+    except:
+        student_list.sort() # Fallback to string sort
 
-    # student_list.sort(key=try_sort) # Sort tricky with mixed types
-
-    selected_student = st.selectbox("選擇幼兒 (ID/姓名):", student_list)
+    selected_student = st.selectbox("選擇幼兒 (ID/姓名):", student_list, key="history_student_select")
 
     if selected_student:
         # Fetch history for this student
@@ -1203,7 +1271,7 @@ def show_history_ui():
         SELECT r.*, o.obs_date, o.activity_name 
         FROM records r
         JOIN observations o ON r.obs_id = o.id
-        WHERE r.student_id = '{selected_student}'
+        WHERE r.student_id = '{selected_student}' AND r.is_deleted = 0
         ORDER BY o.obs_date ASC
         """
         conn = sqlite3.connect(DB_FILE)
@@ -1343,9 +1411,11 @@ appearance_thresh: 0.25
 with_reid: False
 """
     try:
-        with open("custom_botsort_v6.yaml", "w", encoding="utf-8") as f: # v6
+        sid = st.session_state.get('session_id', 'global')
+        tracker_filename = f"custom_tracker_{sid}.yaml"
+        with open(tracker_filename, "w", encoding="utf-8") as f:
             f.write(config_content)
-        return "custom_botsort_v6.yaml"
+        return tracker_filename
     except:
         return "botsort.yaml" # Fallback
 
@@ -1368,7 +1438,7 @@ def reset_analysis_state():
     
     # [v21.4.3 Fix] Truly delete result keys to avoid st.download_button NoneType error
     keys_to_clear = [
-        'id_list', 'id_interactions', 'id_positions', 
+        'id_list', 'id_interactions', 'id_positions', 'id_yaw_history',
         'final_id_count', 'final_id_list', 'excel_ready_data', 
         'group_sync_r', 'social_graph_image', 'video_output_path'
     ]
@@ -1380,6 +1450,7 @@ def reset_analysis_state():
     st.session_state.id_list = set()
     st.session_state.id_interactions = defaultdict(int) 
     st.session_state.id_positions = {}
+    st.session_state.id_yaw_history = {}
 
 # --- 2. 側邊欄：資訊固定 ---
 st.sidebar.header("📋 基本資訊輸入")
@@ -1413,6 +1484,9 @@ else:
     frame_interval = 2
     st.sidebar.caption("⚡ 每 2 幀取樣 1 次 (預設，平衡速度與準確)")
     use_face_mesh = False
+
+# [v73 Fix] Consistently persist interval for interaction time calculation
+st.session_state.last_frame_interval = frame_interval
 
 st.sidebar.markdown("---")
 # [v21.5.5] Cloud Performance Booster Toggle
@@ -1460,9 +1534,31 @@ activity_context = st.sidebar.radio(
 )
 st.session_state.activity_context = activity_context
 
+# [v74 New] Social Sensitivity Slider
+st.sidebar.markdown("### 🕸️ 社交圖譜靈敏度")
+social_threshold_sec = st.sidebar.slider(
+    "判定互動最少秒數 (秒)", 
+    min_value=0.5, max_value=10.0, 
+    value=3.0, step=0.5,
+    help="只有當兩人互動超過此秒數時，才會在社交圖譜中顯示連線。預設為 3 秒。"
+)
+st.session_state.social_threshold_sec = social_threshold_sec
+
 # [v51 New] Decision Tree Visualization Button
 if st.sidebar.button("🌳 顯示 AI 決策樹邏輯"):
     st.session_state.show_decision_tree = True
+
+# [v75 New] Download Guide Button
+try:
+    with open(r"c:\Users\user\OneDrive\桌面\HMEAYC_Project\HMEAYC_功能與操作指南.txt", "r", encoding="utf-8") as f:
+        guide_txt = f.read()
+    st.sidebar.download_button(
+        label="📥 下載系統操作指南 (.txt)",
+        data=guide_txt,
+        file_name="HMEAYC_Operation_Guide.txt",
+        mime="text/plain"
+    )
+except: pass
 
 # [v51 New] Show Decision Tree Diagram (Safe Version)
 if st.session_state.get("show_decision_tree", False):
@@ -1497,12 +1593,6 @@ try:
     init_db()
 except Exception as e:
     st.sidebar.error(f"DB Init Error: {e}")
-
-if mode == "🗄️ 歷史紀錄查閱":
-    show_history_ui()
-    st.stop() # Stop execution to hide analysis UI
-
-
 
 if mode == "🗄️ 歷史紀錄查閱":
     show_history_ui()
@@ -1548,10 +1638,14 @@ if uploaded_file:
         # [v21.4 Fix] Persist Video immediately upon upload to prevent NoneType error later
         try:
             temp_dir = tempfile.gettempdir()
-            # Clean up old persistent files to save space
+            # [v70 Fix] Only clean up files OLDER than 1 hour to prevent deleting active concurrent sessions
+            now = time.time()
             for f in os.listdir(temp_dir):
-                if f.startswith("hmeayc_persist_"):
-                    try: os.remove(os.path.join(temp_dir, f))
+                if f.startswith("hmeayc_persist_") or f.startswith("obs_video_"):
+                    f_path = os.path.join(temp_dir, f)
+                    try:
+                        if now - os.path.getmtime(f_path) > 3600: # 1 hour
+                            os.remove(f_path)
                     except: pass
                     
             p_path = os.path.join(temp_dir, f"hmeayc_persist_{uuid.uuid4().hex[:8]}.mp4")
@@ -1632,10 +1726,9 @@ if not st.session_state.analysis_done:
                     if width % 2 != 0: width -= 1
                     if height % 2 != 0: height -= 1
 
-                    # [v15 Fix] Use UUID to prevent file locking
-                    unique_id = uuid.uuid4().hex[:8]
-                    # [v18.6 Fix] Save to project dir to ensure persistence
-                    output_path = os.path.abspath("obs_video.mp4")
+                    # [v70 Fix] Use Session ID to prevent file locking and multi-user collisions
+                    sid = st.session_state.session_id
+                    output_path = os.path.abspath(f"obs_video_{sid}.mp4")
 
                     # [v67 Fix] Use 'mp4v' as default for better OpenCV stability on mix of platforms
                     # We convert it to H.264 via FFmpeg anyway, so mp4v is safer for the intermediate step.
@@ -1678,25 +1771,23 @@ if not st.session_state.analysis_done:
                 mp_drawing_styles = None
                 holistic_model = None
                 if use_mp:
+                    # [v69 Robust Import] Standard way first, then platform-specific fallbacks
                     try:
-                        import mediapipe.python.solutions.holistic as mp_solutions_holistic
-                        import mediapipe.python.solutions.drawing_utils as mp_drawing_utils
-                        import mediapipe.python.solutions.drawing_styles as mp_drawing_styles_module
-                        
-                        mp_holistic = mp_solutions_holistic
-                        mp_drawing = mp_drawing_utils
-                        mp_drawing_styles = mp_drawing_styles_module
+                        import mediapipe as mp
+                        mp_holistic = mp.solutions.holistic
+                        mp_drawing = mp.solutions.drawing_utils
+                        mp_drawing_styles = mp.solutions.drawing_styles
                     except ImportError:
                         try:
-                            import mediapipe.solutions.holistic as mp_solutions_holistic
-                            import mediapipe.solutions.drawing_utils as mp_drawing_utils
-                            import mediapipe.solutions.drawing_styles as mp_drawing_styles_module
-                            
+                            import mediapipe.python.solutions.holistic as mp_solutions_holistic
+                            import mediapipe.python.solutions.drawing_utils as mp_drawing_utils
+                            import mediapipe.python.solutions.drawing_styles as mp_drawing_styles_module
                             mp_holistic = mp_solutions_holistic
                             mp_drawing = mp_drawing_utils
                             mp_drawing_styles = mp_drawing_styles_module
                         except ImportError as e:
-                            st.error(f"MediaPipe Submodule Import Error: {e}")
+                            st.error(f"MediaPipe Initialization Failed: {e}. Please ensure 'mediapipe' is installed correctly.")
+                            logging.error(f"MediaPipe ImportError: {e}")
                     
                     if mp_holistic:
                         try:
@@ -1716,8 +1807,11 @@ if not st.session_state.analysis_done:
                 while cap.isOpened():
                     ret, frame = cap.read()
                     if not ret:
-                        st.write(f"Debug Info: 讀取結束或讀取失敗 (Frame {f_idx})")
                         break
+                    
+                    # [v69] Show unique warning if MediaPipe is requested but failed to load
+                    if use_mp and holistic_model is None and f_idx == 0:
+                        st.warning("⚠️ MediaPipe 模型未順利載入，微觀模式將轉為 YOLO 基本追蹤。")
                     f_idx += 1
                     # [v47 Fix] Dynamic Frame Interval
                     if f_idx % frame_interval != 0: continue
@@ -1735,6 +1829,12 @@ if not st.session_state.analysis_done:
                             # 1. Use YOLO tracking to find IDs
                             tracker_file = create_tracker_config()
                             results_yolo = model.track(frame, persist=True, verbose=False, conf=0.20, iou=0.7, tracker=tracker_file, imgsz=480, classes=[0])
+
+                            try:
+                                # [v69.1] Use YOLO skeleton as baseline for Micro Mode (Ensure skeletons exist even if MediaPipe fails)
+                                annotated_frame = results_yolo[0].plot(boxes=False, labels=False, probs=False, kpt_line=True, kpt_radius=5)
+                            except:
+                                annotated_frame = frame.copy()
 
                             target_box = None
                             max_area = 0
@@ -1760,7 +1860,9 @@ if not st.session_state.analysis_done:
                                         max_area = area
                                         target_box = [int(x1), int(y1), int(x2), int(y2)]
 
-                            annotated_frame = frame.copy()
+                                # [v69 New] Visual Feedback for Search (Now safe as annotated_frame is defined)
+                                if target_track_id > 0 and not found_specific_id:
+                                    cv2.putText(annotated_frame, f"Searching for ID: {target_track_id}...", (50, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 165, 255), 2)
 
                             if target_box is not None:
                                 x1, y1, x2, y2 = target_box
@@ -1781,70 +1883,79 @@ if not st.session_state.analysis_done:
                                 roi = frame[crop_y1:crop_y2, crop_x1:crop_x2]
 
                                 # 2. Feed ONLY the cropped largest person to MediaPipe
-                                roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-                                results_mp = holistic_model.process(roi_rgb)
+                                # [v69 Safety Fix] Verify model and drawing components exist
+                                if holistic_model is not None and mp_drawing is not None and mp_holistic is not None:
+                                    roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+                                    results_mp = holistic_model.process(roi_rgb)
 
-                                if results_mp.pose_landmarks:
-                                    roi_h, roi_w, _ = roi.shape
+                                    if results_mp.pose_landmarks:
+                                        roi_h, roi_w, _ = roi.shape
 
-                                    # [v66] Use FAST Translation function
-                                    # Translate all landmarks back to full frame
-                                    global_pose = translate_landmarks_fast(results_mp.pose_landmarks, crop_x1, crop_y1, roi_w, roi_h, w_frame, h_frame)
-                                    global_face = translate_landmarks_fast(results_mp.face_landmarks, crop_x1, crop_y1, roi_w, roi_h, w_frame, h_frame) if use_face_mesh else None
-                                    global_lh = translate_landmarks_fast(results_mp.left_hand_landmarks, crop_x1, crop_y1, roi_w, roi_h, w_frame, h_frame)
-                                    global_rh = translate_landmarks_fast(results_mp.right_hand_landmarks, crop_x1, crop_y1, roi_w, roi_h, w_frame, h_frame)
+                                        # [v66] Use FAST Translation function
+                                        # Translate all landmarks back to full frame
+                                        global_pose = translate_landmarks_fast(results_mp.pose_landmarks, crop_x1, crop_y1, roi_w, roi_h, w_frame, h_frame)
+                                        global_face = translate_landmarks_fast(results_mp.face_landmarks, crop_x1, crop_y1, roi_w, roi_h, w_frame, h_frame) if use_face_mesh else None
+                                        global_lh = translate_landmarks_fast(results_mp.left_hand_landmarks, crop_x1, crop_y1, roi_w, roi_h, w_frame, h_frame)
+                                        global_rh = translate_landmarks_fast(results_mp.right_hand_landmarks, crop_x1, crop_y1, roi_w, roi_h, w_frame, h_frame)
 
-                                    # Draw on the original frame using translated landmarks
-                                    mp_drawing.draw_landmarks(annotated_frame, global_pose, mp_holistic.POSE_CONNECTIONS, landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style())
-                                    if global_face:
-                                        mp_drawing.draw_landmarks(annotated_frame, global_face, mp_holistic.FACEMESH_TESSELATION, None, mp_drawing_styles.get_default_face_mesh_tesselation_style())
-                                    if global_lh:
-                                        mp_drawing.draw_landmarks(annotated_frame, global_lh, mp_holistic.HAND_CONNECTIONS)
-                                    if global_rh:
-                                        mp_drawing.draw_landmarks(annotated_frame, global_rh, mp_holistic.HAND_CONNECTIONS)
+                                        # Draw on the original frame using translated landmarks
+                                        mp_drawing.draw_landmarks(annotated_frame, global_pose, mp_holistic.POSE_CONNECTIONS, landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style())
+                                        if global_face:
+                                            mp_drawing.draw_landmarks(annotated_frame, global_face, mp_holistic.FACEMESH_TESSELATION, None, mp_drawing_styles.get_default_face_mesh_tesselation_style())
+                                        if global_lh:
+                                            mp_drawing.draw_landmarks(annotated_frame, global_lh, mp_holistic.HAND_CONNECTIONS)
+                                        if global_rh:
+                                            mp_drawing.draw_landmarks(annotated_frame, global_rh, mp_holistic.HAND_CONNECTIONS)
 
-                                    mid = target_track_id if found_specific_id else 1
-                                    st.session_state.id_list.add(mid)
-                                    st.session_state.display_mapping[mid] = mid
+                                        lms = global_pose.landmark
+                                        cx = int((lms[23].x + lms[24].x) * w_frame / 2) # Hip center for tracking
+                                        cy = int((lms[23].y + lms[24].y) * h_frame / 2)
+                                    else:
+                                        # MediaPipe found nothing, use center of YOLO box
+                                        cx, cy = (x1+x2)//2, (y1+y2)//2
+                                else:
+                                    # [v69 Fallback] Record person using YOLO even if MediaPipe fails to load
+                                    cx, cy = (x1+x2)//2, (y1+y2)//2
 
-                                    if mid not in st.session_state.id_positions:
-                                        st.session_state.id_positions[mid] = []
-                                        st.session_state.id_motion_log[mid] = []
-                                        st.session_state.id_tracking_count[mid] = 0
+                                # Common recording and drawing for the target (Micro Mode)
+                                mid = target_track_id if found_specific_id else 1
+                                st.session_state.id_list.add(mid)
+                                st.session_state.display_mapping[mid] = mid
 
-                                    st.session_state.id_tracking_count[mid] += 1
+                                if mid not in st.session_state.id_positions:
+                                    st.session_state.id_positions[mid] = []
+                                    st.session_state.id_motion_log[mid] = []
+                                    st.session_state.id_tracking_count[mid] = 0
 
-                                    lms = global_pose.landmark
-                                    cx = int((lms[23].x + lms[24].x) * w_frame / 2) # Hip center for tracking
-                                    cy = int((lms[23].y + lms[24].y) * h_frame / 2)
-                                    st.session_state.id_positions[mid].append((f_idx, (cx, cy)))
+                                st.session_state.id_tracking_count[mid] += 1
+                                st.session_state.id_positions[mid].append((f_idx, (cx, cy)))
 
-                                    if mid not in st.session_state.id_actions:
-                                        st.session_state.id_actions[mid] = {}
-                                    st.session_state.id_actions[mid]["微觀追蹤(全身543點)"] = st.session_state.id_actions[mid].get("微觀追蹤(全身543點)", 0) + 1
+                                if mid not in st.session_state.id_actions:
+                                    st.session_state.id_actions[mid] = {}
+                                st.session_state.id_actions[mid]["微觀追蹤(全身543點)"] = st.session_state.id_actions[mid].get("微觀追蹤(全身543點)", 0) + 1
 
-                                    if mid not in st.session_state.id_features:
-                                        # [v67 New] Micro Mode Clothing Extraction
-                                        # Use the target_box to crop shirt and pants from the original frame
-                                        bx1, by1, bx2, by2 = target_box
-                                        bh_box = by2 - by1
-                                        shirt = frame[max(0, by1+int(bh_box*0.1)):min(h_frame, by1 + int(bh_box*0.4)), bx1+int((bx2-bx1)*0.2):bx2-int((bx2-bx1)*0.2)]
-                                        pants = frame[max(0, by1 + int(bh_box*0.6)):min(h_frame, by2-int(bh_box*0.1)), bx1+int((bx2-bx1)*0.2):bx2-int((bx2-bx1)*0.2)]
-                                        
-                                        c_shirt = get_dominant_color(shirt)
-                                        c_pants = get_dominant_color(pants)
-                                        # [v68 Fix] Also support patterns in Micro Mode
-                                        p_shirt = get_clothing_pattern(shirt)
-                                        p_pants = get_clothing_pattern(pants)
-                                        
-                                        feat_str = f"上衣：{c_shirt}{p_shirt}。下裝：{c_pants}{p_pants}、褲子。配件：無。"
-                                        
-                                        st.session_state.id_features[mid] = {
-                                            "clothing": feat_str, 
-                                            "score_pending": True, 
-                                            "original_id": mid,
-                                            "hist": get_color_histogram(shirt)
-                                        }
+                                if mid not in st.session_state.id_features:
+                                    # [v67 New] Micro Mode Clothing Extraction
+                                    # Use the target_box to crop shirt and pants from the original frame
+                                    bx1, by1, bx2, by2 = target_box
+                                    bh_box = by2 - by1
+                                    shirt = frame[max(0, by1+int(bh_box*0.1)):min(h_frame, by1 + int(bh_box*0.4)), bx1+int((bx2-bx1)*0.2):bx2-int((bx2-bx1)*0.2)]
+                                    pants = frame[max(0, by1 + int(bh_box*0.6)):min(h_frame, by2-int(bh_box*0.1)), bx1+int((bx2-bx1)*0.2):bx2-int((bx2-bx1)*0.2)]
+                                    
+                                    c_shirt = get_dominant_color(shirt)
+                                    c_pants = get_dominant_color(pants)
+                                    # [v68 Fix] Also support patterns in Micro Mode
+                                    p_shirt = get_clothing_pattern(shirt)
+                                    p_pants = get_clothing_pattern(pants)
+                                    
+                                    feat_str = f"上衣：{c_shirt}{p_shirt}。下裝：{c_pants}{p_pants}、褲子。配件：無。"
+                                    
+                                    st.session_state.id_features[mid] = {
+                                        "clothing": feat_str, 
+                                        "score_pending": True, 
+                                        "original_id": mid,
+                                        "hist": get_color_histogram(shirt)
+                                    }
 
                                     # [v68 New] Draw Bounding Box around the target
                                     cv2.rectangle(annotated_frame, (crop_x1, crop_y1), (crop_x2, crop_y2), (0, 255, 0), 4)
@@ -2191,17 +2302,31 @@ if not st.session_state.analysis_done:
                                         st.session_state.id_yaw_history[mid] = []
                                     st.session_state.id_yaw_history[mid].append(head_yaw)
 
-                                    # (3) Social Interaction
+                                    # (3) Social Interaction (Refined v72: Distance + Mutual Gaze)
                                     my_center = (center_x, center_y)
                                     for other_mid, pos_list in st.session_state.id_positions.items():
                                         if other_mid == mid: continue
                                         if not pos_list: continue
                                         last_frame_idx, other_pos = pos_list[-1]
+                                        
+                                        # Ensure both are present in roughly the same time (within 5 frames)
                                         if abs(last_frame_idx - f_idx) > 5: continue
+                                        
                                         dist = np.linalg.norm(np.array(my_center) - np.array(other_pos))
+                                        
+                                        # 1. Distance Check (150px)
                                         if dist < 150:
-                                            pair = tuple(sorted((mid, other_mid)))
-                                            st.session_state.id_interactions[pair] = st.session_state.id_interactions.get(pair, 0) + 1
+                                            # 2. Mutual Gaze Check (v72)
+                                            # Get yaws for both
+                                            my_yaw = head_yaw
+                                            other_yaw_list = st.session_state.id_yaw_history.get(other_mid, [0])
+                                            other_yaw = other_yaw_list[-1] if other_yaw_list else 0
+                                            
+                                            # Both must look at each other
+                                            if check_gaze_at_target(my_center, my_yaw, other_pos) and \
+                                               check_gaze_at_target(other_pos, other_yaw, my_center):
+                                                pair = tuple(sorted((mid, other_mid)))
+                                                st.session_state.id_interactions[pair] = st.session_state.id_interactions.get(pair, 0) + 1
                         
                         # [v66] Ensure annotated_frame is closed for Standard Mode block
 
@@ -2254,7 +2379,8 @@ if not st.session_state.analysis_done:
                 # [v21.5.1 Hotfix] Move conversion BEFORE rerun to avoid race condition
                 if os.path.exists(output_path):
                     # [v21.5.3] Use relative path to avoid container mapping issues
-                    converted_path = "obs_video_h264.mp4"
+                    sid = st.session_state.session_id
+                    converted_path = f"obs_video_h264_{sid}.mp4"
                     st.info("🔄 正在轉換影片格式 (H.264) 以支援網頁播放...")
                     
                     import shutil
@@ -2589,10 +2715,11 @@ else:
         # Default
         role = "獨立觀察 (Independent)" 
 
-        # Hierarchy of Roles
-        if interaction_count >= 30 and score >= 3:
+        # Hierarchy of Roles (v72 Update)
+        # 45 samples ~= 3 seconds
+        if interaction_count >= 60 and score >= 3:
             role = "社交活躍 (Active)"
-        elif interaction_count >= 30:
+        elif interaction_count >= 60:
             role = "靜態互動 (Passive)"
         elif focus_score >= 60:
             role = "專注跟隨 (Focused)"
@@ -2900,8 +3027,11 @@ else:
     if st.session_state.id_interactions:
         # Generate graph
         try:
+            # [v74 Fix] Pass sensitivity threshold to graph drawer
+            s_thresh = st.session_state.get('social_threshold_sec', 3.0)
             graph_img = draw_social_graph(st.session_state.id_interactions, 
-                                        {m: f"{m}" for m in st.session_state.id_list})
+                                        {m: f"{m}" for m in st.session_state.id_list},
+                                        min_sec=s_thresh)
             # [v20.11 Refine] Larger Display Width (1100px)
             # [Fix] Convert BGR to RGB for correct color display in Streamlit
             # Display Graph
@@ -2937,11 +3067,17 @@ else:
                         name1 = id_name_map.get(p1, f"ID_{p1}")
                         name2 = id_name_map.get(p2, f"ID_{p2}")
                         
-                        # [v35 Fix] Time calculation based on interaction count
-                        sec = count / 30.0 # Standard 30fps base
+                        # [v73 Fix] Time calculation based on interaction count and sampling
+                        # Each count represents a sample taken every 'frame_interval'
+                        f_int = st.session_state.get('last_frame_interval', 2)
+                        sec = (count * f_int) / 30.0 
+                        
+                        # [v74 New] Threshold indicator for better UX
+                        s_thresh = st.session_state.get('social_threshold_sec', 3.0)
+                        icon = "🔗" if sec >= s_thresh else "⚪"
                         
                         target_col = col_L if i < mid_idx else col_R
-                        target_col.markdown(f"🔗 **{name1}** ↔ **{name2}**: 互動約 {sec:.1f} 秒 (強度: {count})")
+                        target_col.markdown(f"{icon} **{name1}** ↔ **{name2}**: 互動約 {sec:.1f} 秒 (強度: {count})")
 
             st.markdown("""
             **📖 如何解讀社交圖譜 (How to Read)**
@@ -3036,10 +3172,13 @@ else:
     with col_reset:
         # [v65 Restored] Full Reset Button (Clear Cache and Uploads)
         if st.button("🗑️ 清空並建立新分析 (Clear All)"):
+            # [v71 Fix] Protect core session and navigation keys during reset
+            keep_keys = ['session_id', 'nav_mode', 'history_student_select', 'locked_target_id']
             for key in list(st.session_state.keys()):
-                # Delete temp file if exists
-                if key == 'current_tfile_path':
-                    try: os.remove(st.session_state[key])
-                    except: pass
-                del st.session_state[key]
+                if key not in keep_keys:
+                    # Delete temp file if exists for current file path
+                    if key == 'current_tfile_path':
+                        try: os.remove(st.session_state[key])
+                        except: pass
+                    del st.session_state[key]
             st.rerun()
