@@ -1842,7 +1842,7 @@ if not st.session_state.analysis_done:
                             # [v65 Major Upgrade] YOLO-Guided MediaPipe Stability Tracker with Specific ID Targeting
                             # 1. Use YOLO tracking to find IDs
                             tracker_file = create_tracker_config()
-                            results_yolo = model.track(frame, persist=True, verbose=False, conf=0.20, iou=0.7, tracker=tracker_file, imgsz=480, classes=[0])
+                            results_yolo = model.track(frame, persist=True, verbose=False, conf=0.15, iou=0.7, tracker=tracker_file, imgsz=640, classes=[0])
 
                             try:
                                 # [v69.1] Use YOLO skeleton as baseline for Micro Mode (Ensure skeletons exist even if MediaPipe fails)
@@ -1993,10 +1993,10 @@ if not st.session_state.analysis_done:
                             tracker_file = create_tracker_config()
                             # [PyInstaller Fix] Ensure tracker file exists or path is correct (created in current dir)
 
-                            # [調整] 信心度門檻微調 (0.25 -> 0.20) 捕捉更多模糊 ID
+                            # [調整] 信心度門檻微調 (0.20 -> 0.15) 捕捉更多模糊 ID
                             # [調整] IoU (0.5 -> 0.7) 允許更多重疊 (Crowd Robustness)
-                            # [v21] Cloud Optimization: imgsz=480
-                            results = model.track(frame, persist=True, verbose=False, conf=0.20, iou=0.7, tracker=tracker_file, imgsz=480)
+                            # [v21] Cloud Optimization: imgsz=640 (Improved from 480)
+                            results = model.track(frame, persist=True, verbose=False, conf=0.15, iou=0.7, tracker=tracker_file, imgsz=640)
 
                             # 檢查是否有偵測到東西
                             if results and len(results) > 0 and results[0].boxes is not None and results[0].boxes.id is not None:
